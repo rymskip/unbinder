@@ -19,3 +19,6 @@ target/
 # Added by cargo
 
 /target
+
+# macOS Finder metadata
+.DS_Store

@@ -1,0 +1,5 @@
+{
+  "definitions": {
+    "id": { "type": "integer" }
+  }
+}

@@ -160,33 +160,135 @@ function refusal(url, root) {
   return undefined;
 }
 
-// Reads a response as text, giving up once it passes `limit` bytes.
+// Gathers the pieces `next` hands out into text, giving up once they pass
+// `limit` bytes. `next` resolves to nothing when there are no more.
+async function gather(next, limit, url) {
+  const decoder = new TextDecoder();
+  let text = "";
+  let bytes = 0;
+  for (;;) {
+    const piece = await next();
+    if (piece === undefined) {
+      return text + decoder.decode();
+    }
+    bytes += piece.byteLength;
+    if (bytes > limit) {
+      throw new Error(`${url} is larger than the ${limit} bytes left to load`);
+    }
+    text += decoder.decode(piece, { stream: true });
+  }
+}
+
+// Reads a response as text of at most `limit` bytes.
 async function read(response, limit, url) {
   if (response.body === null) {
     return "";
   }
   const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let text = "";
-  let bytes = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) {
-      return text + decoder.decode();
-    }
-    bytes += value.byteLength;
-    if (bytes > limit) {
-      await reader.cancel();
-      throw new Error(`${url} is larger than the ${limit} bytes left to load`);
-    }
-    text += decoder.decode(value, { stream: true });
+  try {
+    return await gather(
+      async () => {
+        const { done, value } = await reader.read();
+        return done ? undefined : value;
+      },
+      limit,
+      url,
+    );
+  } finally {
+    await reader.cancel();
+  }
+}
+
+// One of the modules a runtime with a file system comes with. A browser has
+// none, and a bundler has nothing to resolve, since nothing is imported.
+function builtin(name) {
+  const found = globalThis.process?.getBuiltinModule?.(name);
+  if (found === undefined) {
+    throw new Error("this runtime has no file system; pass a resolver to load files");
+  }
+  return found;
+}
+
+// The file: URL of the file at `location`, which is a path or such a URL
+// already.
+export function fileUrl(location) {
+  return /^file:/i.test(location)
+    ? location
+    : builtin("node:url").pathToFileURL(location).href;
+}
+
+// The folder documents may be read from when the caller asked for the file
+// at the URL `root`: the one the caller names, by path or file: URL, and
+// otherwise the one that holds the file.
+export function fileFolder(root, folder) {
+  const { fileURLToPath } = builtin("node:url");
+  const { dirname, resolve } = builtin("node:path");
+  if (folder === undefined) {
+    return dirname(fileURLToPath(root));
+  }
+  return /^file:/i.test(folder) ? fileURLToPath(folder) : resolve(folder);
+}
+
+const documentTypes = [".json", ".yaml", ".yml"];
+
+// Reads the file at `url` as text of at most `limit` bytes. `root` is the
+// URL of the file the caller asked for.
+//
+// A document names the files it refers to, so what a document can make this
+// read has to be bounded. It reads files on this machine only, and only in
+// `folder` or below it. The folder is checked before the disk is touched, so
+// no other machine is contacted, and again once links are followed, so a
+// link cannot lead out of it. A file a document refers to has to be named as
+// JSON or YAML, since any text reads as YAML and would be inlined.
+export async function loadFile(url, limit, root, folder) {
+  const { fileURLToPath } = builtin("node:url");
+  const { extname, isAbsolute, relative, sep } = builtin("node:path");
+  const { open, realpath } = builtin("node:fs/promises");
+  const refuse = (reason) =>
+    new Error(`the file loader does not read ${url}, which ${reason}; pass a resolver to load it`);
+  const { protocol, hostname } = new URL(url);
+  if (protocol !== "file:") {
+    throw refuse("is not a file");
+  }
+  if (hostname !== "") {
+    throw refuse("names another machine");
+  }
+  const inside = (path, holder) => {
+    const from = relative(holder, path);
+    return from !== "" && from !== ".." && !from.startsWith(`..${sep}`) && !isAbsolute(from);
+  };
+  const path = fileURLToPath(url);
+  if (!inside(path, folder)) {
+    throw refuse(`is outside ${folder}`);
+  }
+  const real = await realpath(path);
+  if (!inside(real, await realpath(folder))) {
+    throw refuse(`is a link that leads outside ${folder}`);
+  }
+  if (url !== root && !documentTypes.includes(extname(real).toLowerCase())) {
+    throw refuse(`is not a ${documentTypes.join(", ")} file`);
+  }
+  const handle = await open(real, "r");
+  try {
+    // Read in pieces, since what a path names need not have an end.
+    const buffer = new Uint8Array(65536);
+    return await gather(
+      async () => {
+        const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+        return bytesRead === 0 ? undefined : buffer.subarray(0, bytesRead);
+      },
+      limit,
+      url,
+    );
+  } finally {
+    await handle.close();
   }
 }
 
 // Loads a document the way a caller who gives no other way gets: fetched as
-// JSON text of at most `limit` bytes. `root` is the URL the caller asked
-// for. A redirect is followed only where its target can be seen and passes
-// the same checks.
+// text of at most `limit` bytes. `root` is the URL the caller asked for. A
+// redirect is followed only where its target can be seen and passes the same
+// checks.
 export async function load(url, limit, root) {
   let target = url;
   for (let hops = 0; hops <= 5; hops += 1) {
@@ -221,6 +323,24 @@ extern "C" {
 
     #[wasm_bindgen(catch)]
     fn load(url: &str, limit: usize, root: &str) -> Result<JsValue, JsValue>;
+
+    #[wasm_bindgen(catch, js_name = loadFile)]
+    fn load_file(url: &str, limit: usize, root: &str, folder: &str) -> Result<JsValue, JsValue>;
+
+    #[wasm_bindgen(catch, js_name = fileFolder)]
+    fn file_folder(root: &str, folder: Option<String>) -> Result<String, JsValue>;
+
+    #[wasm_bindgen(catch, js_name = fileUrl)]
+    fn file_url(location: &str) -> Result<String, JsValue>;
+}
+
+/// Where the documents a schema refers to come from.
+enum Source {
+    /// Whatever the caller's function returns for a URL.
+    Resolver(Function),
+    Fetched,
+    /// Files in the folder at this path and below it.
+    Files(String),
 }
 
 /// Replaces every `$ref` in `schema` with the value it points at.
@@ -259,7 +379,8 @@ pub fn dereference_schema(
 /// bound what a document can make it fetch: only `http:` and `https:` URLs,
 /// never one that names this machine or a private network, and only from the
 /// origin of `url`. Redirects are held to the same rules. Pass a `resolve`
-/// to load anything else.
+/// to load anything else, and use `dereferenceSchemaFromFile` for a document
+/// on disk.
 ///
 /// # Errors
 ///
@@ -274,12 +395,50 @@ pub async fn dereference_schema_from(
         Function,
     >,
 ) -> Result<Ts<Dereferenced>, JsValue> {
-    let options = read_options(options)?;
+    let source = match resolve {
+        Some(resolve) => Source::Resolver(resolve),
+        None => Source::Fetched,
+    };
+    gathered(&url, &read_options(options)?, &source).await
+}
+
+/// `dereferenceSchemaFrom` for a document on disk, in a runtime that has a
+/// file system. `path` is the path of a file or its `file:` URL.
+///
+/// Each document is read as JSON, or as YAML in a build that has it. A
+/// document can make this read only `.json`, `.yaml` and `.yml` files on
+/// this machine, in `folder` and below it, and nothing over a network.
+/// `folder` is a path or a `file:` URL, and is the folder that holds `path`
+/// when it is left out.
+///
+/// # Errors
+///
+/// Rejects where there is no file system, when a file cannot be read or is
+/// one this does not read, and for every reason `dereferenceSchemaFrom`
+/// rejects.
+#[wasm_bindgen(js_name = dereferenceSchemaFromFile)]
+pub async fn dereference_schema_from_file(
+    path: String,
+    #[wasm_bindgen(unchecked_optional_param_type = "Options")] options: Option<Ts<Options>>,
+    #[wasm_bindgen(unchecked_optional_param_type = "string")] folder: Option<String>,
+) -> Result<Ts<Dereferenced>, JsValue> {
+    let root = file_url(&path)?;
+    let source = Source::Files(file_folder(&root, folder)?);
+    gathered(&root, &read_options(options)?, &source).await
+}
+
+/// Loads the document at `url` and every document it leads to from `source`,
+/// then dereferences it.
+async fn gathered(
+    url: &str,
+    options: &Options,
+    source: &Source,
+) -> Result<Ts<Dereferenced>, JsValue> {
     let mut documents = Documents::new();
     let mut loaded: usize = 0;
     // What the documents may still take between them.
     let mut bytes_left = options.max_bytes;
-    let root = Documents::normalized(&url).map_err(thrown)?;
+    let root = Documents::normalized(url).map_err(thrown)?;
     let mut asked = BTreeSet::from([root.clone()]);
     let mut wanted = vec![root.clone()];
     while let Some(next) = wanted.pop() {
@@ -290,26 +449,24 @@ pub async fn dereference_schema_from(
         }
         // One load per turn, so the count cannot saturate.
         loaded = loaded.saturating_add(1);
-        let text = match &resolve {
-            Some(resolve) => {
+        let text = match source {
+            Source::Resolver(resolve) => {
                 let answer = resolve.call1(&JsValue::NULL, &JsValue::from_str(&next))?;
                 json_of(&JsFuture::from(Promise::resolve(&answer)).await?)?
             }
-            // The default loader stops reading at what is left, so a
-            // document too large is never held in full.
-            None => JsFuture::from(Promise::resolve(&load(&next, bytes_left, &root)?))
-                .await?
-                .as_string()
-                .ok_or_else(|| JsError::new("the loader did not return text"))?,
+            // The loaders stop reading at what is left, so a document too
+            // large is never held in full.
+            Source::Fetched => text_of(&load(&next, bytes_left, &root)?).await?,
+            Source::Files(folder) => text_of(&load_file(&next, bytes_left, &root, folder)?).await?,
         };
         bytes_left = bytes_left.checked_sub(text.len()).ok_or_else(|| {
             thrown(Error::SizeLimitExceeded {
                 limit: options.max_bytes,
             })
         })?;
-        let document = match &resolve {
-            Some(_) => serde_json::from_str(&text).map_err(thrown)?,
-            None => read(&text, &options)?,
+        let document = match source {
+            Source::Resolver(_) => serde_json::from_str(&text).map_err(thrown)?,
+            Source::Fetched | Source::Files(_) => read(&text, options)?,
         };
         // Only what this document refers to is new, so only that is looked
         // at, however many documents came before.
@@ -322,7 +479,15 @@ pub async fn dereference_schema_from(
     let Some(document) = documents.get(&root) else {
         return Err(thrown(Error::MissingDocument { url: root }));
     };
-    linked(&document, Some(&documents), &options)
+    linked(&document, Some(&documents), options)
+}
+
+/// The text a loader promised.
+async fn text_of(promised: &JsValue) -> Result<String, JsValue> {
+    JsFuture::from(Promise::resolve(promised))
+        .await?
+        .as_string()
+        .ok_or_else(|| JsError::new("the loader did not return text").into())
 }
 
 /// Dereferences `root` and hands the result to JavaScript as shared objects.

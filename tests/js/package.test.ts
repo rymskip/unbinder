@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, relative } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 
 import init, {
   dereferenceSchema,
   dereferenceSchemaFrom,
+  dereferenceSchemaFromFile,
   dereferenceSchemaText,
   schemaStats,
 } from "../../pkg/unbinder.js";
@@ -658,6 +662,187 @@ test("the default loader stays on the origin it was given", async () => {
   );
 
   assert.equal(calls, 1);
+});
+
+const fixture = (name: string): string =>
+  new URL(`./fixtures/${name}`, import.meta.url).href;
+
+test("reads a document and what it refers to from disk", async () => {
+  const path = fileURLToPath(fixture("order.json"));
+
+  const calls = await withFetch(
+    () => new Response("{}"),
+    async () => {
+      for (const location of [
+        fixture("order.json"),
+        path,
+        relative(process.cwd(), path),
+      ]) {
+        const { schema } = await dereferenceSchemaFromFile(location);
+
+        assert.deepEqual(
+          schema,
+          {
+            title: "Order",
+            properties: {
+              customer: {
+                type: "object",
+                properties: { id: { type: "integer" } },
+              },
+            },
+          },
+          location,
+        );
+      }
+    },
+  );
+
+  assert.equal(calls, 0);
+});
+
+test("says which file is not there", async () => {
+  await assert.rejects(
+    dereferenceSchemaFromFile(fixture("absent.json")),
+    /ENOENT/,
+  );
+});
+
+test("the default loader takes a path for a URL and refuses it", async () => {
+  const calls = await withFetch(
+    () => new Response("{}"),
+    async () => {
+      for (const path of ["/etc/passwd", "schemas/order.json"]) {
+        await assert.rejects(
+          dereferenceSchemaFrom(path),
+          /is not a usable URL/,
+          path,
+        );
+      }
+    },
+  );
+
+  assert.equal(calls, 0);
+});
+
+test("a file leads only to files", async () => {
+  const calls = await withFetch(
+    () => new Response("{}"),
+    async () => {
+      await assert.rejects(
+        dereferenceSchemaFromFile(fixture("remote.json")),
+        /does not read https:\/\/example\.com\/schemas\/order\.json, which is not a file/,
+      );
+    },
+  );
+
+  assert.equal(calls, 0);
+});
+
+test("a file leads only to files on this machine", async () => {
+  await assert.rejects(
+    dereferenceSchemaFromFile(fixture("share.json")),
+    /does not read file:\/\/files\.example\/share\/schema\.json, which names another machine/,
+  );
+});
+
+test("a file leads only to files in its own folder", async () => {
+  await assert.rejects(
+    dereferenceSchemaFromFile(fixture("parts/escape.json")),
+    /does not read file:.*\/fixtures\/shared\.json, which is outside /,
+  );
+});
+
+test("reads from the folder it is given", async () => {
+  const { schema } = await dereferenceSchemaFromFile(
+    fixture("parts/escape.json"),
+    {},
+    fileURLToPath(fixture("")),
+  );
+
+  assert.deepEqual(schema, { above: { type: "integer" } });
+
+  await assert.rejects(
+    dereferenceSchemaFromFile(fixture("order.json"), {}, fixture("parts/")),
+    /order\.json, which is outside /,
+  );
+});
+
+test("a file leads only to files named as documents", async () => {
+  await assert.rejects(
+    dereferenceSchemaFromFile(fixture("notes.json")),
+    /notes\.txt, which is not a \.json, \.yaml, \.yml file/,
+  );
+});
+
+test("a link does not lead out of the folder", async () => {
+  const folder = await mkdtemp(join(tmpdir(), "unbinder-"));
+  try {
+    await symlink(
+      fileURLToPath(fixture("shared.json")),
+      join(folder, "linked.json"),
+    );
+    await writeFile(
+      join(folder, "root.json"),
+      JSON.stringify({ id: { $ref: "linked.json#/definitions/id" } }),
+    );
+
+    await assert.rejects(
+      dereferenceSchemaFromFile(join(folder, "root.json")),
+      /linked\.json, which is a link that leads outside /,
+    );
+
+    await symlink(
+      fileURLToPath(fixture("notes.txt")),
+      join(folder, "renamed.json"),
+    );
+    await writeFile(
+      join(folder, "renamed-root.json"),
+      JSON.stringify({ notes: { $ref: "renamed.json" } }),
+    );
+
+    await assert.rejects(
+      dereferenceSchemaFromFile(
+        join(folder, "renamed-root.json"),
+        {},
+        fileURLToPath(new URL("/", fixture(""))),
+      ),
+      /renamed\.json, which is not a \.json, \.yaml, \.yml file/,
+    );
+  } finally {
+    await rm(folder, { recursive: true });
+  }
+});
+
+test("a fetched document cannot make the default loader read a file", async () => {
+  const calls = await withFetch(
+    () =>
+      new Response(JSON.stringify({ secrets: { $ref: fixture("shared.json") } })),
+    async () => {
+      await assert.rejects(
+        dereferenceSchemaFrom(order),
+        /the default loader does not fetch file:.*shared\.json, which is not an http or https URL/,
+      );
+    },
+  );
+
+  assert.equal(calls, 1);
+});
+
+test("stops reading a file that is too large", async () => {
+  await assert.rejects(
+    dereferenceSchemaFromFile(fixture("order.json"), { maxBytes: 16 }),
+    /order\.json is larger than the 16 bytes left to load/,
+  );
+});
+
+test("a pointer may leave the slashes of a name unescaped", () => {
+  const { schema } = dereferenceSchema({
+    paths: { "/users/{id}": { get: { summary: "One user" } } },
+    link: { $ref: "#/paths//users/{id}/get" },
+  });
+
+  assert.ok(isRecord(schema));
+  assert.deepEqual(schema.link, { summary: "One user" });
 });
 
 test("the default loader stops reading a document that is too large", async () => {

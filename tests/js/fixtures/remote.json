@@ -1,0 +1,3 @@
+{
+  "elsewhere": { "$ref": "https://example.com/schemas/order.json" }
+}

@@ -1,0 +1,5 @@
+Customer:
+  type: object
+  properties:
+    id:
+      $ref: '../shared.json#/definitions/id'

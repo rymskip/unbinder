@@ -1,0 +1,3 @@
+{
+  "share": { "$ref": "file://files.example/share/schema.json" }
+}

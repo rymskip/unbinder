@@ -15,7 +15,8 @@ self-contained by replacing references with their actual content.
 -   **Finite on recursive schemas**: a cycle is expanded one level, then left
     as a `$ref`, and the references involved are reported
 -   **Standards-based pointers**: JSON Pointer per RFC 6901, with `~0` and `~1`
-    escapes and percent-encoding
+    escapes and percent-encoding, and a name whose `/` was left unescaped is
+    still found
 -   **Bounded**: limits on output depth and size stop a hostile document from
     exhausting the stack or memory, and the analysis is linear in the document
 -   **Typed errors**: every failure names the reference and the reason
@@ -165,12 +166,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 In JavaScript, `dereferenceSchemaFrom` does the loading. It fetches each
-document and reads it as JSON or YAML, unless it is given another way to get
-one:
+document and reads it as JSON or YAML, and `dereferenceSchemaFromFile` reads
+them from disk instead. Pass a resolver to get them another way:
 
 ```javascript
-import init, { dereferenceSchemaFrom } from "unbinder";
-import { readFile } from "node:fs/promises";
+import init, {
+    dereferenceSchemaFrom,
+    dereferenceSchemaFromFile,
+} from "unbinder";
 
 await init();
 
@@ -178,19 +181,27 @@ const { schema } = await dereferenceSchemaFrom(
     "https://example.com/schemas/order.json",
 );
 
-// Or load documents yourself, here from disk.
-const fromDisk = await dereferenceSchemaFrom(
-    new URL("schemas/order.json", import.meta.url).href,
+// From disk, by path or file: URL, in Node.js, Bun and Deno.
+const fromDisk = await dereferenceSchemaFromFile("schemas/order.json");
+
+// Or load documents yourself, here with a header the server asks for.
+const withHeader = await dereferenceSchemaFrom(
+    "https://example.com/schemas/order.json",
     {},
-    async (url) => JSON.parse(await readFile(new URL(url), "utf8")),
+    async (url) =>
+        (await fetch(url, { headers: { accept: "application/schema+json" } })).json(),
 );
 ```
 
-A document names the URLs it refers to, so the built-in loader bounds what a
-document can make it fetch: only `http:` and `https:` URLs, never one that
-names the local machine or a private network, and only from the origin of the
-URL you gave it. Redirects are held to the same rules, and it stops reading
-once the documents pass `maxBytes`. To load anything else, pass a resolver.
+A document names the URLs it refers to, so the built-in loaders bound what a
+document can make them load. A fetched document leads only to `http:` and
+`https:` URLs, never one that names the local machine or a private network,
+and only on the origin of the URL you gave it. Redirects are held to the same
+rules. A file leads only to `.json`, `.yaml` and `.yml` files on this machine,
+in the folder of the file you named or below it, and a link in that folder
+cannot lead out of it. Name another folder as the third argument to read from
+there instead. Both stop reading once the documents pass `maxBytes`. To load
+anything else, pass a resolver.
 
 An `$id` gives a document, or a part of one, a URL of its own that references
 can use, and makes pointers inside that part start at it. As in
@@ -381,6 +392,11 @@ function dereferenceSchemaFrom(
     options?: Options,
     resolve?: (url: string) => unknown,
 ): Promise<Dereferenced>;
+function dereferenceSchemaFromFile(
+    path: string,
+    options?: Options,
+    folder?: string,
+): Promise<Dereferenced>;
 function dereferenceSchemaText(json: string, options?: Options): string;
 function schemaStats(schema: any): Stats;
 ```
@@ -433,16 +449,18 @@ Run it with `pixi run bench`.
     JavaScript package always has it.
 -   `wasm`: the JavaScript bindings. Off by default, so a Rust program that
     targets WebAssembly does not export them.
--   `yaml`: lets `dereferenceSchemaFrom` read YAML documents as well as JSON.
+-   `yaml`: lets `dereferenceSchemaFrom` and `dereferenceSchemaFromFile` read
+    YAML documents as well as JSON.
     The published JavaScript package is built with it. The YAML parser is
     most of that module's size, so a build without it is about a third as
     large.
 
 ## Limitations
 
--   A reference into another document is followed only through `Documents`
-    or `dereferenceSchemaFrom`. `dereference_schema` and `dereferenceSchema`
-    take one document and report such a reference as an error.
+-   A reference into another document is followed only through `Documents`,
+    `dereferenceSchemaFrom` or `dereferenceSchemaFromFile`.
+    `dereference_schema` and `dereferenceSchema` take one document and report
+    such a reference as an error.
 -   A circular reference left in place inside a document that was loaded
     stays as written, relative to that document and not to the output.
 -   A pointer that passes through a `$ref` with sibling keywords finds the
@@ -452,6 +470,8 @@ Run it with `pixi run bench`.
     schema `true`, and dropped when it is `false` or is not a schema.
 -   Every object with a string `$ref` member is treated as a reference,
     including one inside `enum`, `const`, `default` or `examples`.
+-   A reference written under the name `$ref` that points at a string is an
+    error. Inlining it would leave a `$ref` that nothing resolved.
 -   `$anchor` and `$dynamicRef` are not interpreted.
 -   Dereferencing a recursive schema twice expands its cycles a second level.
 

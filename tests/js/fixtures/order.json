@@ -1,0 +1,6 @@
+{
+  "title": "Order",
+  "properties": {
+    "customer": { "$ref": "parts/customer.yaml#/Customer" }
+  }
+}

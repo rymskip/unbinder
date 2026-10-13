@@ -1,0 +1,8 @@
+{
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@apidevtools/json-schema-ref-parser": "^16.0.5",
+    "tinybench": "^6.2.2"
+  }
+}

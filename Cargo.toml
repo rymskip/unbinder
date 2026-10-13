@@ -2,11 +2,11 @@
 name = "unbinder"
 version = "0.1.7"
 edition = "2021"
-authors = ["jakobloch <38576440+jakobloch@users.noreply.github.com>"]
+authors = ["rymskip <38576440+rymskip@users.noreply.github.com>"]
 description = "A high-performance JSON Schema dereferencer for resolving $ref pointers"
 documentation = "https://docs.rs/unbinder"
-homepage = "https://github.com/jakobloch/unbinder"
-repository = "https://github.com/jakobloch/unbinder"
+homepage = "https://github.com/rymskip/unbinder"
+repository = "https://github.com/rymskip/unbinder"
 license = "MIT"
 readme = "README.md"
 keywords = ["json-schema", "dereference", "ref", "wasm", "no-std"]

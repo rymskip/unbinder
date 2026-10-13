@@ -16,9 +16,9 @@ target/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-# Added by cargo
-
-/target
-
 # macOS Finder metadata
 .DS_Store
+
+# JavaScript tooling and the built npm package
+node_modules/
+/pkg/

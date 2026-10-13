@@ -1,0 +1,16 @@
+{
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build-package.js",
+    "typecheck": "tsc --project tests/js",
+    "test": "bun run build && bun run typecheck && node --test \"tests/js/**/*.test.ts\"",
+    "publish:npm": "bun run test && npm publish ./pkg",
+    "publish:jsr": "bun run test && cd pkg && jsr publish"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "jsr": "^0.14.3",
+    "typescript": "^7.0.2"
+  }
+}

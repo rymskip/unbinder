@@ -107,9 +107,9 @@ use unbinder::{Options, dereference_schema_shared};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let schema = json!({
+        "address": { "type": "object" },
         "billing": { "$ref": "#/address" },
-        "shipping": { "$ref": "#/address" },
-        "address": { "type": "object" }
+        "shipping": { "$ref": "#/address" }
     });
 
     let shared = dereference_schema_shared(&schema, &Options::default())?;
@@ -193,9 +193,14 @@ once the documents pass `maxBytes`. To load anything else, pass a resolver.
 
 ### Circular references
 
-By default a reference that takes part in a cycle is inlined wherever it is
-reached from outside the cycle and left in place inside it. The references
-left in place are listed in `circular`.
+A tree and text cannot hold a cycle, so there a reference that takes part in
+one is inlined wherever it is reached from outside the cycle and left in place
+inside it. The references that close a cycle are listed in `circular`.
+
+In JavaScript the result is made of objects, which can hold a cycle, so by
+default `dereferenceSchema` links a recursive schema back into itself, as
+json-schema-ref-parser does: `schema.list.properties.next === schema.list`.
+Pass `circular: "expand"` for the one-level expansion instead.
 
 ```rust
 use serde_json::json;
@@ -243,11 +248,14 @@ fn main() -> Result<(), Error> {
 
 | Field       | Default  | Meaning                                                     |
 | ----------- | -------- | ----------------------------------------------------------- |
-| `circular`  | `Expand` | `Expand` a cycle one level, `Ignore` it, or `Reject` it     |
+| `circular`  | `Link`   | `Link` a cycle, `Expand` it one level, `Ignore` or `Reject` it |
 | `siblings`  | `Deep`   | Merge sibling objects into the target's, or replace them    |
 | `max_depth` | 128      | How deep the output may nest                                |
 | `max_bytes` | 256 MiB  | Roughly how much memory the output may take as a tree       |
 | `max_documents` | 1024 | How many documents the references may lead through          |
+
+`Link` joins a cycle into the result where the result is JavaScript objects,
+and is the same as `Expand` for a tree or text.
 
 With `siblings: Deep`, a sibling `properties` object is merged into the
 target's `properties`, and so on inward. Arrays and other values in a sibling
@@ -296,7 +304,7 @@ import init, { dereferenceSchema, type Options } from "unbinder";
 await init();
 
 const options: Options = { circular: "reject", maxDepth: 64, maxBytes: 1_000_000 };
-// circular: "expand" | "ignore" | "reject", siblings: "deep" | "shallow"
+// circular: "link" | "expand" | "ignore" | "reject", siblings: "deep" | "shallow"
 
 try {
     dereferenceSchema({ self: { $ref: "#/self" } }, options);
@@ -342,7 +350,7 @@ Counts the `objects`, `arrays` and `references` in a document.
 
 ```typescript
 interface Options {
-    circular?: "expand" | "ignore" | "reject";
+    circular?: "link" | "expand" | "ignore" | "reject";
     siblings?: "deep" | "shallow";
     maxDepth?: number;
     maxBytes?: number;
@@ -413,6 +421,9 @@ Run it with `pixi run bench`.
 
 -   `std` (default): links the standard library. Without it the crate is
     `no_std` and needs only `alloc`.
+-   `preserve_order`: keeps the members of every object in the order the
+    document has them. Without it they come out sorted by name. The
+    JavaScript package always has it.
 -   `wasm`: the JavaScript bindings. Off by default, so a Rust program that
     targets WebAssembly does not export them.
 
@@ -450,8 +461,10 @@ Run it with `pixi run bench`.
     are a plain object instead of an `Options` class, errors are `Error`
     instances instead of `WasmError`, `estimateSchemaSize` is replaced by
     `schemaStats`, and `getMemoryUsage` is removed.
--   In JavaScript, the places that refer to one target share one object. Use
-    `structuredClone` or `dereferenceSchemaText` for independent copies.
+-   In JavaScript, the places that refer to one target share one object, and
+    a recursive schema is linked back into itself. Use `circular: "expand"`
+    with `structuredClone`, or `dereferenceSchemaText`, for independent
+    copies.
 
 ## Contributing
 

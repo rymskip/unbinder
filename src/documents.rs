@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 use fluent_uri::{Iri, IriRef};
 use serde_json::Value;
 
-use crate::dereference::{Options, SharedSchema, expand};
+use crate::dereference::{Form, Options, SharedSchema, expand};
 use crate::error::Error;
 use crate::walk::{Values, reference_of};
 
@@ -180,7 +180,7 @@ impl Documents {
     /// [`dereference_schema_shared`]: crate::dereference_schema_shared
     pub fn dereference(&self, url: &str, options: &Options) -> Result<SharedSchema<'_>, Error> {
         let root = self.find(None, url)?;
-        let (shared, bytes) = expand(root, Some(self), options)?;
+        let (shared, bytes) = expand(root, Some(self), options, Form::Written)?;
         if bytes > options.max_bytes {
             return Err(Error::SizeLimitExceeded {
                 limit: options.max_bytes,

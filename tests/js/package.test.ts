@@ -53,8 +53,56 @@ test("inlines references into plain objects", () => {
   assert.deepEqual(circular, []);
 });
 
-test("expands a recursive schema one level and reports the cycle", () => {
+test("links a recursive schema back into itself", () => {
   const { schema, circular } = dereferenceSchema(recursive);
+
+  assert.ok(isRecord(schema) && isRecord(schema.definitions));
+  const node = schema.definitions.node;
+  assert.ok(isRecord(node) && isRecord(node.properties));
+  assert.equal(schema.list, node);
+  assert.equal(node.properties.next, node);
+  assert.deepEqual(circular, ["#/definitions/node"]);
+  assert.throws(() => JSON.stringify(schema), TypeError);
+});
+
+test("links a cycle that runs through several definitions", () => {
+  const { schema } = dereferenceSchema({
+    a: { b: { $ref: "#/b" } },
+    b: { c: [{ $ref: "#/c" }] },
+    c: { a: { $ref: "#/a" }, title: "C" },
+    entry: { $ref: "#/b" },
+  });
+
+  assert.ok(isRecord(schema) && isRecord(schema.a) && isRecord(schema.b));
+  assert.ok(isRecord(schema.c) && Array.isArray(schema.b.c));
+  assert.equal(schema.a.b, schema.b);
+  assert.equal(schema.b.c[0], schema.c);
+  assert.equal(schema.c.a, schema.a);
+  assert.equal(schema.entry, schema.b);
+  assert.equal(schema.c.title, "C");
+});
+
+test("keeps the members of an object in the order they were written", () => {
+  const { schema } = dereferenceSchema({
+    zebra: { $ref: "#/base", title: "Zebra", apple: 1 },
+    base: { middle: true, alpha: true, title: "Base" },
+    apple: { $ref: "#/base" },
+  });
+
+  assert.ok(isRecord(schema) && isRecord(schema.zebra));
+  assert.deepEqual(Object.keys(schema), ["zebra", "base", "apple"]);
+  assert.deepEqual(Object.keys(schema.zebra), [
+    "title",
+    "apple",
+    "middle",
+    "alpha",
+  ]);
+});
+
+test("expands a recursive schema one level and reports the cycle", () => {
+  const { schema, circular } = dereferenceSchema(recursive, {
+    circular: "expand",
+  });
 
   assert.deepEqual(schema, {
     definitions: {
@@ -223,7 +271,10 @@ test("the text interface returns the same result as JSON", () => {
     circular: "expand",
   });
 
-  assert.deepEqual(JSON.parse(text), dereferenceSchema(recursive));
+  assert.deepEqual(
+    JSON.parse(text),
+    dereferenceSchema(recursive, { circular: "expand" }),
+  );
   throwsError(() => dereferenceSchemaText("{"), "EOF");
 });
 

@@ -54,8 +54,11 @@ proptest = "1.12.0"
 [features]
 default = ["std"]
 std = ["fluent-uri/std", "percent-encoding/std", "serde/std", "serde_json/std"]
+# Keeps the members of an object in the order the document has them.
+preserve_order = ["std", "serde_json/preserve_order"]
 wasm = [
     "std",
+    "preserve_order",
     "dep:js-sys",
     "serde/derive",
     "dep:tsify",

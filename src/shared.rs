@@ -7,8 +7,10 @@
 //! document. It expands into the full tree only when it is written out.
 
 use alloc::borrow::ToOwned;
-use alloc::rc::Rc;
+use alloc::collections::BTreeMap;
+use alloc::rc::{Rc, Weak};
 use alloc::vec::Vec;
+use core::cell::OnceCell;
 use core::convert::Infallible;
 
 use serde::ser::SerializeMap;
@@ -24,30 +26,65 @@ pub(crate) enum Shared<'doc> {
     Object(Rc<[(&'doc str, Self)]>),
     /// The expansion of a target. Every reference to the target holds the
     /// same one.
-    Inlined(Rc<Self>),
+    Inlined(Rc<Anchor<'doc>>),
     /// An object with the keywords next to a reference merged over it.
     Merged(Rc<Merged<'doc>>),
+    /// A reference to a target that was still being expanded when the
+    /// reference was reached, which closes a cycle.
+    Back(Back<'doc>),
+}
+
+/// The one expansion of a target.
+#[derive(Debug)]
+pub(crate) struct Anchor<'doc> {
+    pub(crate) value: Shared<'doc>,
+}
+
+/// A link back to an expansion that contains it.
+#[derive(Clone, Debug)]
+pub(crate) struct Back<'doc> {
+    /// The expansion, once it is finished. Held weakly, because the
+    /// expansion holds this link.
+    pub(crate) link: Rc<OnceCell<Weak<Anchor<'doc>>>>,
+    /// The reference as written, for an output that cannot hold a cycle.
+    pub(crate) written: &'doc Value,
+}
+
+impl<'doc> Back<'doc> {
+    /// The expansion this links back to, while it is alive.
+    pub(crate) fn target(&self) -> Option<Rc<Anchor<'doc>>> {
+        self.link.get().and_then(Weak::upgrade)
+    }
 }
 
 #[derive(Debug)]
 pub(crate) struct Merged<'doc> {
     /// The object merged into.
     pub(crate) base: Shared<'doc>,
-    /// The members that replace the base's or add to them, sorted by name.
+    /// The members that replace the base's or add to them, in the order
+    /// they were written.
     pub(crate) overrides: Vec<(&'doc str, Shared<'doc>)>,
+    /// Where each override is, by name.
+    positions: BTreeMap<&'doc str, usize>,
 }
 
 impl<'doc> Merged<'doc> {
-    pub(crate) fn new(base: Shared<'doc>, mut overrides: Vec<(&'doc str, Shared<'doc>)>) -> Self {
-        overrides.sort_unstable_by_key(|(name, _)| *name);
-        Self { base, overrides }
+    pub(crate) fn new(base: Shared<'doc>, overrides: Vec<(&'doc str, Shared<'doc>)>) -> Self {
+        let positions = overrides
+            .iter()
+            .enumerate()
+            .map(|(position, (name, _))| (*name, position))
+            .collect();
+        Self {
+            base,
+            overrides,
+            positions,
+        }
     }
 
     fn overridden(&self, name: &str) -> Option<&Shared<'doc>> {
-        match self.overrides.binary_search_by_key(&name, |(held, _)| held) {
-            Ok(position) => self.overrides.get(position).map(|(_, member)| member),
-            Err(_) => None,
-        }
+        let position = self.positions.get(name)?;
+        self.overrides.get(*position).map(|(_, member)| member)
     }
 }
 
@@ -57,8 +94,8 @@ impl<'doc> Shared<'doc> {
         match self {
             Self::Original(value) => value.is_object(),
             Self::Object(_) | Self::Merged(_) => true,
-            Self::Array(_) => false,
-            Self::Inlined(inner) => inner.is_object(),
+            Self::Array(_) | Self::Back(_) => false,
+            Self::Inlined(anchor) => anchor.value.is_object(),
         }
     }
 
@@ -66,9 +103,9 @@ impl<'doc> Shared<'doc> {
     /// where they are kept in a list, and none where they are indexed.
     pub(crate) fn scan(&self) -> usize {
         match self {
-            Self::Original(_) | Self::Array(_) => 0,
+            Self::Original(_) | Self::Array(_) | Self::Back(_) => 0,
             Self::Object(members) => members.len(),
-            Self::Inlined(inner) => inner.scan(),
+            Self::Inlined(anchor) => anchor.value.scan(),
             Self::Merged(merged) => merged.base.scan(),
         }
     }
@@ -77,9 +114,9 @@ impl<'doc> Shared<'doc> {
     pub(crate) fn width(&self) -> usize {
         match self {
             Self::Original(value) => value.as_object().map_or(0, Map::len),
-            Self::Array(_) => 0,
+            Self::Array(_) | Self::Back(_) => 0,
             Self::Object(members) => members.len(),
-            Self::Inlined(inner) => inner.width(),
+            Self::Inlined(anchor) => anchor.value.width(),
             Self::Merged(merged) => merged.base.width().saturating_add(merged.overrides.len()),
         }
     }
@@ -92,8 +129,8 @@ impl<'doc> Shared<'doc> {
                 .iter()
                 .find(|(held, _)| *held == name)
                 .map(|(_, member)| member.clone()),
-            Self::Array(_) => None,
-            Self::Inlined(inner) => inner.member(name),
+            Self::Array(_) | Self::Back(_) => None,
+            Self::Inlined(anchor) => anchor.value.member(name),
             Self::Merged(merged) => merged
                 .overridden(name)
                 .cloned()
@@ -102,7 +139,8 @@ impl<'doc> Shared<'doc> {
     }
 
     /// Calls `visit` with each member of this object, and with nothing if it
-    /// is not one.
+    /// is not one. The keywords written next to a reference come first, then
+    /// what its target adds.
     pub(crate) fn members<Failure>(
         &self,
         visit: &mut dyn FnMut(&'doc str, &Self) -> Result<(), Failure>,
@@ -117,25 +155,19 @@ impl<'doc> Shared<'doc> {
             Self::Object(members) => members
                 .iter()
                 .try_for_each(|(name, member)| visit(name, member)),
-            Self::Array(_) => Ok(()),
-            Self::Inlined(inner) => inner.members(visit),
+            Self::Array(_) | Self::Back(_) => Ok(()),
+            Self::Inlined(anchor) => anchor.value.members(visit),
             Self::Merged(merged) => {
-                // The overrides are sorted, so slotting each in ahead of the
-                // first base member that sorts after it keeps the members in
-                // order whenever the base's are.
-                let mut pending = merged.overrides.iter().peekable();
-                merged.base.members(&mut |name, member| {
-                    while let Some((held, replacement)) = pending.next_if(|(held, _)| *held < name)
-                    {
-                        visit(held, replacement)?;
-                    }
-                    match pending.next_if(|(held, _)| *held == name) {
-                        Some((held, replacement)) => visit(held, replacement),
-                        None if merged.overridden(name).is_some() => Ok(()),
+                merged
+                    .overrides
+                    .iter()
+                    .try_for_each(|(name, member)| visit(name, member))?;
+                merged
+                    .base
+                    .members(&mut |name, member| match merged.overridden(name) {
+                        Some(_) => Ok(()),
                         None => visit(name, member),
-                    }
-                })?;
-                pending.try_for_each(|(name, member)| visit(name, member))
+                    })
             }
         }
     }
@@ -152,7 +184,7 @@ impl<'doc> Shared<'doc> {
                     .map(|(name, member)| ((*name).to_owned(), member.to_value()))
                     .collect(),
             ),
-            Self::Inlined(inner) => inner.to_value(),
+            Self::Inlined(anchor) => anchor.value.to_value(),
             Self::Merged(_) => {
                 let mut members = Map::new();
                 let Ok(()) = self.members::<Infallible>(&mut |name, member| {
@@ -161,6 +193,7 @@ impl<'doc> Shared<'doc> {
                 });
                 Value::Object(members)
             }
+            Self::Back(back) => back.written.clone(),
         }
     }
 }
@@ -173,12 +206,13 @@ impl Serialize for Shared<'_> {
             Self::Object(members) => {
                 format.collect_map(members.iter().map(|(name, member)| (name, member)))
             }
-            Self::Inlined(inner) => inner.serialize(format),
+            Self::Inlined(anchor) => anchor.value.serialize(format),
             Self::Merged(_) => {
                 let mut map = format.serialize_map(None)?;
                 self.members(&mut |name, member| map.serialize_entry(name, member))?;
                 map.end()
             }
+            Self::Back(back) => back.written.serialize(format),
         }
     }
 }

@@ -22,10 +22,7 @@ const maxBytes = 4_294_967_295;
 const objectToObject = "object to object";
 const textToText = "text to text";
 
-/**
- * The two ways the libraries are compared. Only `ignore` makes them produce
- * the same document.
- */
+/** The two ways the libraries are compared. */
 const modes = [
   {
     name: "ignore",
@@ -39,9 +36,9 @@ const modes = [
     name: "default",
     native: "expand",
     note:
-      "ref-parser links cycles into the result; unbinder expands a cycle one level and leaves a $ref",
+      "cycles are linked into the result, and both libraries return the same objects; a tree or text cannot hold a cycle, so those rows expand it one level",
     refParser: {},
-    unbinder: { circular: "expand", maxBytes },
+    unbinder: { circular: "link", maxBytes },
     serializable: false,
   },
 ];
@@ -216,18 +213,12 @@ for (const name of names) {
 
   for (const mode of modes) {
     console.log(`\n${mode.name}: ${mode.note}`);
-    if (mode.serializable) {
-      const theirs = await $RefParser.dereference(
-        structuredClone(parsed),
-        mode.refParser,
-      );
-      const ours = dereferenceSchema(parsed, mode.unbinder).schema;
-      console.log(
-        `outputs identical: ${isDeepStrictEqual(theirs, ours)}, ${
-          (JSON.stringify(ours).length / 1024).toFixed(0)
-        } KiB`,
-      );
-    }
+    const theirs = await $RefParser.dereference(
+      structuredClone(parsed),
+      mode.refParser,
+    );
+    const ours = dereferenceSchema(parsed, mode.unbinder).schema;
+    console.log(`outputs identical: ${isDeepStrictEqual(theirs, ours)}`);
     const rows = [
       ...await measureJavaScript(text, parsed, mode),
       ...native

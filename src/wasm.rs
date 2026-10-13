@@ -25,9 +25,9 @@ use tsify::Ts;
 use wasm_bindgen::prelude::{JsError, JsValue, wasm_bindgen};
 use wasm_bindgen_futures::JsFuture;
 
-use crate::dereference::expand;
+use crate::dereference::{Form, expand};
 use crate::documents::Document;
-use crate::shared::Shared;
+use crate::shared::{Anchor, Shared};
 use crate::{
     Dereferenced, Documents, Error, Options, SharedSchema, Stats, dereference_schema_shared,
 };
@@ -35,11 +35,11 @@ use crate::{
 #[wasm_bindgen(inline_js = r#"
 // Builds the result from a table of entries. An entry is a value with holes
 // and the links that fill them: [path, entry, inherit]. A plain link puts the
-// value of another entry at the path. An inheriting link gives the object at
-// the path every member of the other entry's value that it does not have.
-// Entries come after the entries they link to, and the document is last.
+// value of another entry at the path, which is how a cycle closes. An
+// inheriting link gives the object at the path every member of the other
+// entry's value that it does not have.
 export function link(text) {
-  const { nodes, circular } = JSON.parse(text);
+  const { nodes, order, root, circular } = JSON.parse(text);
   // Defining a property keeps a member named __proto__ a plain member.
   const define = (holder, name, value) =>
     Object.defineProperty(holder, name, {
@@ -48,28 +48,42 @@ export function link(text) {
       enumerable: true,
       configurable: true,
     });
+  const place = (node, path) => {
+    let holder = node;
+    let slot = 0;
+    for (const step of path) {
+      holder = holder[slot];
+      slot = step;
+    }
+    return [holder, slot];
+  };
+  // Every hole is filled before anything is inherited, so that what is
+  // inherited is complete.
   for (const node of nodes) {
     for (const [path, entry, inherit] of node[1]) {
-      let holder = node;
-      let slot = 0;
-      for (const step of path) {
-        holder = holder[slot];
-        slot = step;
+      if (!inherit) {
+        const [holder, slot] = place(node, path);
+        define(holder, slot, nodes[entry][0]);
       }
-      const source = nodes[entry][0];
+    }
+  }
+  // An entry was finished after the entries it takes members from.
+  for (const index of order) {
+    const node = nodes[index];
+    for (const [path, entry, inherit] of node[1]) {
       if (inherit) {
+        const [holder, slot] = place(node, path);
         const heir = holder[slot];
+        const source = nodes[entry][0];
         for (const name of Object.keys(source)) {
           if (!Object.hasOwn(heir, name)) {
             define(heir, name, source[name]);
           }
         }
-      } else {
-        define(holder, slot, source);
       }
     }
   }
-  return { schema: nodes[nodes.length - 1][0], circular };
+  return { schema: nodes[root][0], circular };
 }
 
 const privateSuffixes = [
@@ -292,7 +306,7 @@ fn linked(
 ) -> Result<Ts<Dereferenced>, JsValue> {
     // The limit is on what the result takes, and shared objects take no more
     // room for being referred to often. The table counts what it writes.
-    let (shared, _) = expand(root, documents, options).map_err(thrown)?;
+    let (shared, _) = expand(root, documents, options, Form::Linked).map_err(thrown)?;
     let table = Table::write(&shared, options)?;
     Ok(Ts::new_unchecked(link(&table)?))
 }
@@ -410,9 +424,13 @@ struct Table<'doc, 'options> {
     /// are shared, but each place that merges keywords into a target gets
     /// members of its own, so the table counts what it writes.
     bytes_left: usize,
-    entries: Vec<u8>,
+    /// The entries written so far, by position.
+    entries: BTreeMap<usize, Vec<u8>>,
+    /// The positions in the order their entries were finished.
+    order: Vec<usize>,
+    /// How many positions have been given out.
     count: usize,
-    targets: BTreeMap<*const Shared<'doc>, Target>,
+    targets: BTreeMap<*const Anchor<'doc>, Target>,
 }
 
 impl<'doc, 'options> Table<'doc, 'options> {
@@ -420,14 +438,25 @@ impl<'doc, 'options> Table<'doc, 'options> {
         let mut table = Self {
             options,
             bytes_left: options.max_bytes,
-            entries: Vec::new(),
+            entries: BTreeMap::new(),
+            order: Vec::new(),
             count: 0,
             targets: BTreeMap::new(),
         };
-        table.entry(schema.shared())?;
+        let root = table.reserve();
+        table.entry(root, schema.shared())?;
         let mut text = Vec::from(*b"{\"nodes\":[");
-        text.extend(table.entries);
-        text.extend(b"],\"circular\":");
+        for (position, entry) in &table.entries {
+            if *position > 0 {
+                text.push(b',');
+            }
+            text.extend(entry);
+        }
+        text.extend(b"],\"order\":");
+        serde_json::to_writer(&mut text, &table.order)?;
+        text.extend(b",\"root\":");
+        serde_json::to_writer(&mut text, &root)?;
+        text.extend(b",\"circular\":");
         serde_json::to_writer(&mut text, schema.circular())?;
         text.push(b'}');
         Ok(String::from_utf8(text).map_err(<serde_json::Error as serde::ser::Error>::custom)?)
@@ -445,9 +474,16 @@ impl<'doc, 'options> Table<'doc, 'options> {
         }
     }
 
-    /// Writes the entry for `value` after the entries it links to, and
-    /// returns its position.
-    fn entry(&mut self, value: &Shared<'doc>) -> Result<usize, Failure> {
+    /// Gives out the next position.
+    fn reserve(&mut self) -> usize {
+        let position = self.count;
+        // One position per target, so the count cannot saturate.
+        self.count = self.count.saturating_add(1);
+        position
+    }
+
+    /// Writes the entry at `position` for `value`.
+    fn entry(&mut self, position: usize, value: &Shared<'doc>) -> Result<(), Failure> {
         let mut entry = Entry {
             table: self,
             plain: Vec::new(),
@@ -456,31 +492,30 @@ impl<'doc, 'options> Table<'doc, 'options> {
         };
         entry.value(value)?;
         let Entry { plain, links, .. } = entry;
-        if self.count > 0 {
-            self.entries.push(b',');
-        }
-        self.entries.push(b'[');
-        self.entries.extend(plain);
-        self.entries.push(b',');
-        serde_json::to_writer(&mut self.entries, &links)?;
-        self.entries.push(b']');
-        let position = self.count;
-        // One entry per target, so the count cannot saturate.
-        self.count = self.count.saturating_add(1);
-        Ok(position)
+        let mut written = Vec::from(*b"[");
+        written.extend(plain);
+        written.push(b',');
+        serde_json::to_writer(&mut written, &links)?;
+        written.push(b']');
+        self.entries.insert(position, written);
+        self.order.push(position);
+        Ok(())
     }
 
-    /// The entry of an inlined target, written on first use.
-    fn inlined(&mut self, target: &Rc<Shared<'doc>>) -> Result<Target, Failure> {
+    /// The entry of an inlined target, written on first use. Its position is
+    /// given out before it is written, so a link back to it from inside it
+    /// has somewhere to point.
+    fn inlined(&mut self, target: &Rc<Anchor<'doc>>) -> Result<Target, Failure> {
         if let Some(known) = self.targets.get(&Rc::as_ptr(target)) {
             return Ok(*known);
         }
-        let written = Target {
-            position: self.entry(target)?,
-            members: target.width(),
+        let reserved = Target {
+            position: self.reserve(),
+            members: target.value.width(),
         };
-        self.targets.insert(Rc::as_ptr(target), written);
-        Ok(written)
+        self.targets.insert(Rc::as_ptr(target), reserved);
+        self.entry(reserved.position, &target.value)?;
+        Ok(reserved)
     }
 }
 
@@ -503,7 +538,7 @@ impl<'doc> Entry<'_, 'doc, '_> {
     }
 
     /// Records that the place being written takes `target`.
-    fn link(&mut self, target: &Rc<Shared<'doc>>, inherit: bool) -> Result<(), Failure> {
+    fn link(&mut self, target: &Rc<Anchor<'doc>>, inherit: bool) -> Result<(), Failure> {
         let target = self.table.inlined(target)?;
         let given = if inherit { target.members } else { 1 };
         self.table.charge(
@@ -547,6 +582,14 @@ impl<'doc> Entry<'_, 'doc, '_> {
                 self.plain.extend(b"null");
                 Ok(())
             }
+            Shared::Back(back) => match back.target() {
+                Some(target) => {
+                    self.link(&target, false)?;
+                    self.plain.extend(b"null");
+                    Ok(())
+                }
+                None => self.write(back.written),
+            },
             Shared::Merged(merged) => {
                 self.plain.push(b'{');
                 let mut first = true;

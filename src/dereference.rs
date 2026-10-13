@@ -2,9 +2,10 @@
 
 use alloc::borrow::ToOwned;
 use alloc::collections::{BTreeMap, BTreeSet};
-use alloc::rc::Rc;
+use alloc::rc::{Rc, Weak};
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::cell::OnceCell;
 use core::convert::Infallible;
 use core::ptr;
 
@@ -14,7 +15,7 @@ use serde_json::{Map, Value};
 use crate::documents::{Document, Documents};
 use crate::error::Error;
 use crate::references::{CycleId, References, Target};
-use crate::shared::{Merged, Shared};
+use crate::shared::{Anchor, Back, Merged, Shared};
 use crate::walk::{REFERENCE_KEY, reference_of};
 
 /// The memory a value takes inside its parent.
@@ -31,9 +32,13 @@ const NAME_BYTES: usize = size_of::<String>();
     serde(rename_all = "lowercase")
 )]
 pub enum CircularPolicy {
+    /// Link a cycle back into itself where the output can hold one, as a
+    /// result made of JavaScript objects can. A tree or text cannot, and
+    /// gets what [`CircularPolicy::Expand`] gives.
+    #[default]
+    Link,
     /// Inline the cycle once, then leave the reference that would repeat it
     /// in place.
-    #[default]
     Expand,
     /// Leave in place every reference that leads to a cycle, without
     /// inlining any of it.
@@ -130,8 +135,8 @@ pub struct Dereferenced {
 ///
 /// let schema = json!({
 ///     "first": { "$ref": "#/name" },
-///     "second": { "$ref": "#/name" },
-///     "name": { "type": "string" }
+///     "name": { "type": "string" },
+///     "second": { "$ref": "#/name" }
 /// });
 ///
 /// let shared = dereference_schema_shared(&schema, &Options::default())?;
@@ -272,7 +277,7 @@ pub fn dereference_schema_shared<'doc>(
         root: schema,
         url: None,
     };
-    let (shared, bytes) = expand(root, None, options)?;
+    let (shared, bytes) = expand(root, None, options, Form::Written)?;
     if bytes > options.max_bytes {
         return Err(Error::SizeLimitExceeded {
             limit: options.max_bytes,
@@ -288,12 +293,25 @@ pub(crate) fn expand<'doc>(
     root: Document<'doc>,
     documents: Option<&'doc Documents>,
     options: &Options,
+    form: Form,
 ) -> Result<(SharedSchema<'doc>, usize), Error> {
+    let linking = match (form, options.circular) {
+        (Form::Linked, CircularPolicy::Link) => true,
+        (
+            Form::Linked | Form::Written,
+            CircularPolicy::Link
+            | CircularPolicy::Expand
+            | CircularPolicy::Ignore
+            | CircularPolicy::Reject,
+        ) => false,
+    };
     let mut expansion = Expansion {
         references: References::analyze(root, documents, options)?,
         options,
+        linking,
         bytes_left: options.max_bytes,
         inlined: BTreeMap::new(),
+        expanding: BTreeMap::new(),
         circular: BTreeSet::new(),
     };
     let expanded = expansion.value(root.root, root, None, options.max_depth)?;
@@ -306,6 +324,15 @@ pub(crate) fn expand<'doc>(
             .collect(),
     };
     Ok((schema, expanded.bytes))
+}
+
+/// What the expansion is for.
+#[derive(Clone, Copy)]
+pub(crate) enum Form {
+    /// A tree or text, which holds a copy of a target at every reference.
+    Written,
+    /// Objects that refer to one another, which can hold a cycle.
+    Linked,
 }
 
 /// A value with what it comes to once written out as a tree.
@@ -331,7 +358,11 @@ impl<'doc> Measured<'doc> {
     fn is(&self, value: &Value) -> bool {
         match &self.shared {
             Shared::Original(original) => ptr::eq(*original, value),
-            Shared::Array(_) | Shared::Object(_) | Shared::Inlined(_) | Shared::Merged(_) => false,
+            Shared::Array(_)
+            | Shared::Object(_)
+            | Shared::Inlined(_)
+            | Shared::Merged(_)
+            | Shared::Back(_) => false,
         }
     }
 }
@@ -359,11 +390,17 @@ impl Totals {
 struct Expansion<'doc, 'options> {
     references: References<'doc>,
     options: &'options Options,
+    /// Whether a reference that closes a cycle becomes a link back to the
+    /// target, in place of staying as written.
+    linking: bool,
     /// What the shared form may still allocate.
     bytes_left: usize,
     /// The expansion of each target inlined so far, by where the target sits
     /// in the document.
     inlined: BTreeMap<*const Value, Measured<'doc>>,
+    /// The targets being expanded right now, each with the place its
+    /// finished expansion goes for the links back to it.
+    expanding: BTreeMap<*const Value, Rc<OnceCell<Weak<Anchor<'doc>>>>>,
     circular: BTreeSet<&'doc str>,
 }
 
@@ -403,7 +440,9 @@ impl<'doc> Expansion<'doc, '_> {
         match target {
             // A target reached where it stands expands to what a reference
             // to it inlines, so the two share one expansion.
-            Some(target) if target.cycle() == enclosing => self.inline(&target, depth_left),
+            Some(target) if self.linking || target.cycle() == enclosing => {
+                self.inline(&target, depth_left)
+            }
             Some(_) | None => self.expand(node, within, enclosing, depth_left),
         }
     }
@@ -423,24 +462,31 @@ impl<'doc> Expansion<'doc, '_> {
                 Err(self.too_deep())
             };
         }
-        let mut expanded = self.expand(
+        let link = Rc::new(OnceCell::new());
+        self.expanding.insert(address, Rc::clone(&link));
+        let expanded = self.expand(
             target.value(),
             target.document(),
             target.cycle(),
             depth_left,
-        )?;
+        );
+        self.expanding.remove(&address);
+        let mut expanded = expanded?;
         expanded.shared = match expanded.shared {
             // A scalar is copied, and a reference to a reference shares the
             // expansion it already points at.
             Shared::Original(
                 value @ (Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)),
             ) => Shared::Original(value),
-            shared @ Shared::Inlined(_) => shared,
+            shared @ (Shared::Inlined(_) | Shared::Back(_)) => shared,
             shared @ (Shared::Original(Value::Array(_) | Value::Object(_))
             | Shared::Array(_)
             | Shared::Object(_)
-            | Shared::Merged(_)) => Shared::Inlined(Rc::new(shared)),
+            | Shared::Merged(_)) => Shared::Inlined(Rc::new(Anchor { value: shared })),
         };
+        if let Shared::Inlined(anchor) = &expanded.shared {
+            link.get_or_init(|| Rc::downgrade(anchor));
+        }
         self.inlined.insert(address, expanded.clone());
         Ok(expanded)
     }
@@ -546,17 +592,37 @@ impl<'doc> Expansion<'doc, '_> {
         depth_left: usize,
     ) -> Result<Measured<'doc>, Error> {
         let target = self.references.target(within, reference)?;
-        let stays = match self.options.circular {
-            CircularPolicy::Ignore => target.leads_to_cycle(),
-            // Two targets share a cycle only when each leads to the other, so
-            // inlining this one would lead back to the target being inlined.
-            CircularPolicy::Expand | CircularPolicy::Reject => {
-                target.cycle().is_some() && target.cycle() == enclosing
+        if let Some(link) = self.expanding.get(&ptr::from_ref(target.value()))
+            && self.linking
+        {
+            self.circular.insert(reference);
+            // Keywords next to the reference would have to merge into a
+            // target that is not finished, so such a reference stays.
+            if members.len() > 1 {
+                return self.object(node, members, within, enclosing, depth_left);
             }
-        };
+            return Ok(Measured {
+                shared: Shared::Back(Back {
+                    link: Rc::clone(link),
+                    written: node,
+                }),
+                height: 1,
+                bytes: VALUE_BYTES,
+            });
+        }
+        let stays = !self.linking
+            && match self.options.circular {
+                CircularPolicy::Ignore => target.leads_to_cycle(),
+                // Two targets share a cycle only when each leads to the
+                // other, so inlining this one would lead back to the target
+                // being inlined.
+                CircularPolicy::Link | CircularPolicy::Expand | CircularPolicy::Reject => {
+                    target.cycle().is_some() && target.cycle() == enclosing
+                }
+            };
         if stays {
             return match self.options.circular {
-                CircularPolicy::Expand | CircularPolicy::Ignore => {
+                CircularPolicy::Link | CircularPolicy::Expand | CircularPolicy::Ignore => {
                     self.circular.insert(reference);
                     self.object(node, members, within, enclosing, depth_left)
                 }

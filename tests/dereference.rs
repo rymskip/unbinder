@@ -645,6 +645,91 @@ fn a_pointer_finds_the_own_members_of_a_reference_first() {
 }
 
 #[test]
+fn a_pointer_may_leave_the_slashes_of_a_name_unescaped() {
+    let schema = json!({
+        "paths": { "/users/{id}": { "get": { "summary": "One user" } } },
+        "escaped": { "$ref": "#/paths/~1users~1{id}/get" },
+        "unescaped": { "$ref": "#/paths//users/{id}/get" }
+    });
+
+    assert_eq!(
+        member(&schema, "escaped"),
+        Ok(Some(json!({ "summary": "One user" })))
+    );
+    assert_eq!(
+        member(&schema, "unescaped"),
+        Ok(Some(json!({ "summary": "One user" })))
+    );
+}
+
+#[test]
+fn a_pointer_reads_a_slash_as_a_separator_first() {
+    let schema = json!({
+        "a": { "b": { "const": "nested" } },
+        "a/b": { "const": "joined" },
+        "target": { "$ref": "#/a/b" }
+    });
+
+    assert_eq!(
+        member(&schema, "target"),
+        Ok(Some(json!({ "const": "nested" })))
+    );
+}
+
+#[test]
+fn a_pointer_takes_the_longest_name_its_tokens_spell() {
+    let schema = json!({
+        "names": {
+            "x/y": { "z": { "const": "short" } },
+            "x/y/z": { "const": "long" },
+            "x/y/z/w": { "const": "longer than the pointer" }
+        },
+        "target": { "$ref": "#/names/x/y/z" },
+        "past": { "$ref": "#/names/x/y/z/const" }
+    });
+
+    assert_eq!(
+        member(&schema, "target"),
+        Ok(Some(json!({ "const": "long" })))
+    );
+    assert_eq!(member(&schema, "past"), Ok(Some(json!("long"))));
+}
+
+#[test]
+fn a_pointer_through_a_reference_may_leave_slashes_unescaped() {
+    let schema = json!({
+        "base": { "a/b": { "const": "base" } },
+        "extended": { "$ref": "#/base", "c/d": { "const": "own" } },
+        "own": { "$ref": "#/extended/c/d" },
+        "inherited": { "$ref": "#/extended/a/b" }
+    });
+
+    assert_eq!(member(&schema, "own"), Ok(Some(json!({ "const": "own" }))));
+    assert_eq!(
+        member(&schema, "inherited"),
+        Ok(Some(json!({ "const": "base" })))
+    );
+}
+
+#[test]
+fn reports_the_first_token_no_name_starts_with() {
+    let schema = json!({
+        "names": { "x/y": {} },
+        "target": { "$ref": "#/names/x/z" }
+    });
+
+    assert_eq!(
+        member(&schema, "target"),
+        Err(unresolved(
+            "#/names/x/z",
+            PointerError::MissingKey {
+                key: "x".to_owned()
+            }
+        ))
+    );
+}
+
+#[test]
 fn reports_a_pointer_through_a_reference_to_itself() {
     let schema = json!({ "a": { "$ref": "#/a" }, "b": { "$ref": "#/a/x" } });
 

@@ -15,7 +15,6 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::{IntoIter, Vec};
 use core::cell::Cell;
-use core::iter::Peekable;
 use core::mem;
 use core::ptr;
 
@@ -24,7 +23,7 @@ use serde_json::Value;
 use crate::dereference::Options;
 use crate::documents::{Document, Documents, absolute, split, survey};
 use crate::error::{Error, PointerError};
-use crate::pointer;
+use crate::pointer::{self, Slashed};
 use crate::walk::reference_of;
 
 /// Identifies a group of targets that can all reach one another.
@@ -88,7 +87,9 @@ struct Walk<'doc> {
     current: &'doc Value,
     /// The resource `current` is in.
     within: Document<'doc>,
-    tokens: Peekable<IntoIter<String>>,
+    tokens: Vec<String>,
+    /// How many of the tokens have been applied.
+    applied: usize,
     /// The references passed through since the last token was applied.
     passed: BTreeSet<*const Value>,
 }
@@ -100,14 +101,6 @@ impl Walk<'_> {
             cause,
         }
     }
-}
-
-/// The reference a pointer has to pass through before `token` can be applied
-/// to `current`. A reference's own members come first, as they do once its
-/// target is merged into it.
-fn passes_through<'doc>(current: &'doc Value, token: &str) -> Option<&'doc str> {
-    let reference = reference_of(current)?;
-    (!current.as_object()?.contains_key(token)).then_some(reference)
 }
 
 /// The targets each target leads to, keyed by where the target sits in its
@@ -149,6 +142,9 @@ pub(crate) struct References<'doc> {
     names: BTreeMap<String, &'doc Value>,
     /// The resource each value that starts one is the root of.
     scopes: BTreeMap<*const Value, Document<'doc>>,
+    /// The names that hold a `/`, for each object a pointer looked for one
+    /// in.
+    slashed: BTreeMap<*const Value, Slashed<'doc>>,
     /// The roots of the documents looked through so far.
     admitted: Vec<&'doc Value>,
     /// References found in an admitted document and not yet resolved.
@@ -174,6 +170,7 @@ impl<'doc> References<'doc> {
             resources: BTreeMap::new(),
             names: BTreeMap::new(),
             scopes: BTreeMap::new(),
+            slashed: BTreeMap::new(),
             admitted: Vec::new(),
             unresolved: Vec::new(),
             cycles: 0,
@@ -234,6 +231,24 @@ impl<'doc> References<'doc> {
         self.scopes.get(&ptr::from_ref(value))
     }
 
+    /// The member of `current` that the tokens ahead name, and how many of
+    /// them name it. A name that holds a `/` may be spelled by several.
+    fn member(&mut self, current: &'doc Value, ahead: &[String]) -> Option<(&'doc Value, usize)> {
+        let members = current.as_object()?;
+        if let Some(member) = members.get(ahead.first()?) {
+            return Some((member, 1));
+        }
+        if ahead.len() < 2 {
+            return None;
+        }
+        let (name, count) = self
+            .slashed
+            .entry(ptr::from_ref(current))
+            .or_insert_with(|| Slashed::of(members))
+            .longest(ahead)?;
+        Some((members.get(name)?, count))
+    }
+
     /// The target of `reference` as written in the resource `within`,
     /// resolved on first use.
     ///
@@ -253,7 +268,8 @@ impl<'doc> References<'doc> {
         let mut waiting = Vec::new();
         let mut walk = self.start(within, reference, &mut active)?;
         loop {
-            let Some(token) = walk.tokens.peek() else {
+            let ahead = walk.tokens.get(walk.applied..).unwrap_or_default();
+            let Some(token) = ahead.first() else {
                 let target = self.register(&walk);
                 active.remove(&walk.key);
                 let Some(resumed) = waiting.pop() else {
@@ -264,13 +280,28 @@ impl<'doc> References<'doc> {
                 walk.within = target.document.clone();
                 continue;
             };
-            let Some(through) = passes_through(walk.current, token) else {
-                walk.current = pointer::descend(walk.current, token)
-                    .map_err(|cause| walk.unresolved(cause))?;
+            let found = self.member(walk.current, ahead);
+            // A reference's own members come first, as they do once its
+            // target is merged into it. The pointer passes through it for
+            // any other.
+            let through = match found {
+                Some(_) => None,
+                None => reference_of(walk.current),
+            };
+            let Some(through) = through else {
+                let (next, count) = match found {
+                    Some(found) => found,
+                    None => (
+                        pointer::descend(walk.current, token)
+                            .map_err(|cause| walk.unresolved(cause))?,
+                        1,
+                    ),
+                };
+                walk.current = next;
                 if let Some(scope) = self.scope(walk.current) {
                     walk.within = scope.clone();
                 }
-                walk.tokens.next();
+                walk.applied = walk.applied.saturating_add(count);
                 walk.passed.clear();
                 continue;
             };
@@ -371,7 +402,8 @@ impl<'doc> References<'doc> {
             key,
             current,
             within: self.scope(current).cloned().unwrap_or(resource),
-            tokens: tokens.into_iter().peekable(),
+            tokens,
+            applied: 0,
             passed: BTreeSet::new(),
         })
     }

@@ -186,6 +186,27 @@ proptest! {
     }
 
     #[test]
+    fn a_name_can_be_referenced_with_its_slashes_unescaped(
+        parts in vec("[a-z~ %{}]{0,4}", 2..6),
+    ) {
+        let name = parts.join("/");
+        let reference = format!(
+            "#/definitions/{}",
+            parts
+                .iter()
+                .map(|part| utf8_percent_encode(&part.replace('~', "~0"), NON_ALPHANUMERIC).to_string())
+                .collect::<Vec<_>>()
+                .join("/")
+        );
+        let definitions: Map<String, Value> = [(name, json!({ "type": "string" }))].into_iter().collect();
+        let schema = json!({ "definitions": definitions, "target": { "$ref": reference } });
+
+        let dereferenced = dereference_schema(&schema)?;
+
+        prop_assert_eq!(dereferenced.schema.get("target"), Some(&json!({ "type": "string" })));
+    }
+
+    #[test]
     fn exactly_the_references_on_a_cycle_are_kept(graph in reference_graph()) {
         let expected = references_on_a_cycle(&graph);
 

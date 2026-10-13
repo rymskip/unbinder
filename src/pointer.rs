@@ -7,7 +7,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use percent_encoding::percent_decode_str;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::error::PointerError;
 
@@ -48,6 +48,73 @@ pub(crate) fn descend<'doc>(
             })
         }
     }
+}
+
+/// The member names of one object that hold a `/`, in order.
+///
+/// A name written into a pointer with its `/` not escaped reads as several
+/// tokens. Such a pointer is followed all the same: where a token names no
+/// member, the longest run of tokens that spells one of these names is taken
+/// as that name.
+#[derive(Debug)]
+pub(crate) struct Slashed<'doc> {
+    names: Vec<&'doc str>,
+}
+
+impl<'doc> Slashed<'doc> {
+    pub(crate) fn of(members: &'doc Map<String, Value>) -> Self {
+        let mut names: Vec<_> = members
+            .keys()
+            .map(String::as_str)
+            .filter(|name| name.contains('/'))
+            .collect();
+        names.sort_unstable();
+        Self { names }
+    }
+
+    /// The longest name that the first of `tokens` spell when a `/` joins
+    /// them, and how many of them it takes, which is two at the least.
+    pub(crate) fn longest(&self, tokens: &[String]) -> Option<(&'doc str, usize)> {
+        let mut candidates = self.names.as_slice();
+        let mut spelled: usize = 0;
+        let mut longest = None;
+        for (position, token) in tokens.iter().enumerate() {
+            if position > 0 {
+                candidates = continuing(candidates, spelled, "/");
+                spelled = spelled.saturating_add(1);
+            }
+            candidates = continuing(candidates, spelled, token);
+            spelled = spelled.saturating_add(token.len());
+            // A name sorts ahead of every longer name that starts with it.
+            match candidates.first() {
+                Some(name) if position > 0 && name.len() == spelled => {
+                    longest = Some((*name, position.saturating_add(1)));
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        longest
+    }
+}
+
+/// The `candidates` that go on with `piece` after their first `spelled`
+/// bytes, which they all share. Only `piece` is compared, so following a
+/// name costs its length once, however many tokens spell it.
+fn continuing<'names, 'doc>(
+    candidates: &'names [&'doc str],
+    spelled: usize,
+    piece: &str,
+) -> &'names [&'doc str] {
+    let below = candidates.partition_point(|name| rest(name, spelled) < piece.as_bytes());
+    let from = candidates.get(below..).unwrap_or_default();
+    let run = from.partition_point(|name| rest(name, spelled).starts_with(piece.as_bytes()));
+    from.get(..run).unwrap_or_default()
+}
+
+/// What `name` holds after its first `spelled` bytes.
+fn rest(name: &str, spelled: usize) -> &[u8] {
+    name.as_bytes().get(spelled..).unwrap_or_default()
 }
 
 fn unescape(token: &str) -> Result<String, PointerError> {

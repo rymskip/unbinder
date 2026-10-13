@@ -9,6 +9,7 @@
 
 use alloc::borrow::ToOwned;
 use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::format;
 use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec;
@@ -21,10 +22,10 @@ use core::ptr;
 use serde_json::Value;
 
 use crate::dereference::Options;
-use crate::documents::{Document, Documents, split};
+use crate::documents::{Document, Documents, absolute, split, survey};
 use crate::error::{Error, PointerError};
 use crate::pointer;
-use crate::walk::{Values, reference_of};
+use crate::walk::reference_of;
 
 /// Identifies a group of targets that can all reach one another.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,10 +56,10 @@ impl<'doc> Target<'doc> {
         self.value
     }
 
-    /// The document the value is in, which its own references are relative
+    /// The resource the value is in, which its own references are relative
     /// to.
-    pub(crate) fn document(&self) -> Document<'doc> {
-        self.document
+    pub(crate) fn document(&self) -> &Document<'doc> {
+        &self.document
     }
 
     /// The cycle this target takes part in, if any.
@@ -77,7 +78,7 @@ impl<'doc> Target<'doc> {
 /// written in and by its text.
 type Written<'doc> = (*const Value, &'doc str);
 
-fn written<'doc>(within: Document<'doc>, reference: &'doc str) -> Written<'doc> {
+fn written<'doc>(within: &Document<'doc>, reference: &'doc str) -> Written<'doc> {
     (ptr::from_ref(within.root), reference)
 }
 
@@ -85,7 +86,7 @@ fn written<'doc>(within: Document<'doc>, reference: &'doc str) -> Written<'doc> 
 struct Walk<'doc> {
     key: Written<'doc>,
     current: &'doc Value,
-    /// The document `current` is in.
+    /// The resource `current` is in.
     within: Document<'doc>,
     tokens: Peekable<IntoIter<String>>,
     /// The references passed through since the last token was applied.
@@ -117,7 +118,9 @@ type Successors<'doc> = BTreeMap<*const Value, Vec<Rc<Target<'doc>>>>;
 enum Step<'doc> {
     Enter(&'doc Value),
     /// Every value inside the innermost open target has been entered.
-    Leave,
+    LeaveTarget,
+    /// Every value inside the innermost open resource has been entered.
+    LeaveResource,
 }
 
 /// A target whose successors are still being followed.
@@ -140,16 +143,27 @@ pub(crate) struct References<'doc> {
     /// Two spellings of one pointer share a target, so targets are told
     /// apart by the address of the value they point at.
     by_address: BTreeMap<*const Value, Rc<Target<'doc>>>,
+    /// The resources ids set up inside the documents, by URL.
+    resources: BTreeMap<String, Document<'doc>>,
+    /// The values ids name by a fragment, by full URL.
+    names: BTreeMap<String, &'doc Value>,
+    /// The resource each value that starts one is the root of.
+    scopes: BTreeMap<*const Value, Document<'doc>>,
+    /// The roots of the documents looked through so far.
+    admitted: Vec<&'doc Value>,
+    /// References found in an admitted document and not yet resolved.
+    unresolved: Vec<(&'doc str, Document<'doc>)>,
     cycles: usize,
     /// How many references a pointer may pass through between two tokens.
     max_hops: usize,
+    max_documents: usize,
 }
 
 impl<'doc> References<'doc> {
     /// Resolves every reference `root` leads to, in it and in the documents
     /// it refers to, and finds the cycles among them.
     pub(crate) fn analyze(
-        root: Document<'doc>,
+        root: &Document<'doc>,
         documents: Option<&'doc Documents>,
         options: &Options,
     ) -> Result<Self, Error> {
@@ -157,29 +171,22 @@ impl<'doc> References<'doc> {
             documents,
             by_reference: BTreeMap::new(),
             by_address: BTreeMap::new(),
+            resources: BTreeMap::new(),
+            names: BTreeMap::new(),
+            scopes: BTreeMap::new(),
+            admitted: Vec::new(),
+            unresolved: Vec::new(),
             cycles: 0,
             max_hops: options.max_depth,
+            max_documents: options.max_documents,
         };
-        let mut reached = Vec::new();
-        let mut found = BTreeSet::from([ptr::from_ref(root.root)]);
-        let mut pending = vec![root];
-        while let Some(document) = pending.pop() {
-            reached.push(document);
-            for reference in Values::of(document.root).filter_map(reference_of) {
-                let target = references.target(document, reference)?;
-                if found.insert(ptr::from_ref(target.document.root)) {
-                    if found.len() > options.max_documents {
-                        return Err(Error::DocumentLimitExceeded {
-                            limit: options.max_documents,
-                        });
-                    }
-                    pending.push(target.document);
-                }
-            }
+        references.admit(root)?;
+        while let Some((reference, within)) = references.unresolved.pop() {
+            references.target(&within, reference)?;
         }
         let mut successors = Successors::new();
-        for document in reached {
-            references.successors(document.root, &mut successors);
+        for admitted in references.admitted.clone() {
+            references.successors(admitted, &mut successors);
         }
         let starts: Vec<_> = references.by_address.values().map(Rc::clone).collect();
         for start in starts {
@@ -188,12 +195,46 @@ impl<'doc> References<'doc> {
         Ok(references)
     }
 
+    /// Looks through `document`, once: notes the resources and names its ids
+    /// set up, and queues its references to be resolved.
+    fn admit(&mut self, document: &Document<'doc>) -> Result<(), Error> {
+        if self
+            .admitted
+            .iter()
+            .any(|admitted| ptr::eq(*admitted, document.root))
+        {
+            return Ok(());
+        }
+        if self.admitted.len() >= self.max_documents {
+            return Err(Error::DocumentLimitExceeded {
+                limit: self.max_documents,
+            });
+        }
+        self.admitted.push(document.root);
+        let surveyed = survey(document);
+        for resource in surveyed.resources {
+            self.scopes
+                .insert(ptr::from_ref(resource.root), resource.clone());
+            if let Some(url) = &resource.url {
+                self.resources.insert(url.as_ref().to_owned(), resource);
+            }
+        }
+        self.names.extend(surveyed.names);
+        self.unresolved.extend(surveyed.references);
+        Ok(())
+    }
+
     /// The target that `value` is, if any reference points at it.
     pub(crate) fn at(&self, value: &Value) -> Option<Rc<Target<'doc>>> {
         self.by_address.get(&ptr::from_ref(value)).map(Rc::clone)
     }
 
-    /// The target of `reference` as written in the document `within`,
+    /// The resource `value` is the root of, if an id makes it one.
+    pub(crate) fn scope(&self, value: &Value) -> Option<&Document<'doc>> {
+        self.scopes.get(&ptr::from_ref(value))
+    }
+
+    /// The target of `reference` as written in the resource `within`,
     /// resolved on first use.
     ///
     /// A pointer that reaches a reference with tokens still to apply passes
@@ -202,7 +243,7 @@ impl<'doc> References<'doc> {
     /// of them cannot exhaust the call stack.
     pub(crate) fn target(
         &mut self,
-        within: Document<'doc>,
+        within: &Document<'doc>,
         reference: &'doc str,
     ) -> Result<Rc<Target<'doc>>, Error> {
         if let Some(known) = self.by_reference.get(&written(within, reference)) {
@@ -220,12 +261,15 @@ impl<'doc> References<'doc> {
                 };
                 walk = resumed;
                 walk.current = target.value;
-                walk.within = target.document;
+                walk.within = target.document.clone();
                 continue;
             };
             let Some(through) = passes_through(walk.current, token) else {
                 walk.current = pointer::descend(walk.current, token)
                     .map_err(|cause| walk.unresolved(cause))?;
+                if let Some(scope) = self.scope(walk.current) {
+                    walk.within = scope.clone();
+                }
                 walk.tokens.next();
                 walk.passed.clear();
                 continue;
@@ -235,46 +279,98 @@ impl<'doc> References<'doc> {
                     limit: self.max_hops,
                 });
             }
-            let through = written(walk.within, through);
-            if !walk.passed.insert(ptr::from_ref(walk.current)) || active.contains(&through) {
+            let key = written(&walk.within, through);
+            if !walk.passed.insert(ptr::from_ref(walk.current)) || active.contains(&key) {
                 return Err(walk.unresolved(PointerError::ReferenceLoop));
             }
-            if let Some(known) = self.by_reference.get(&through) {
+            if let Some(known) = self.by_reference.get(&key) {
                 walk.current = known.value;
-                walk.within = known.document;
+                walk.within = known.document.clone();
             } else {
-                let next = self.start(walk.within, through.1, &mut active)?;
+                let from = walk.within.clone();
+                let next = self.start(&from, through, &mut active)?;
                 waiting.push(mem::replace(&mut walk, next));
             }
         }
     }
 
+    /// The resource a reference written in `within` points into, when it
+    /// names one by a URL.
+    fn resource(
+        &mut self,
+        within: &Document<'doc>,
+        reference: &str,
+        location: &str,
+    ) -> Result<Document<'doc>, Error> {
+        let external = || Error::ExternalReference {
+            reference: reference.to_owned(),
+        };
+        let url = match absolute(within.url.as_deref(), location) {
+            Ok(url) => url,
+            // With no other documents to go by, a relative URL is simply a
+            // reference out of this one.
+            Err(invalid) => {
+                return Err(match self.documents {
+                    Some(_) => invalid,
+                    None => external(),
+                });
+            }
+        };
+        if let Some(resource) = self.resources.get(&url) {
+            return Ok(resource.clone());
+        }
+        let Some(documents) = self.documents else {
+            return Err(external());
+        };
+        if let Some(document) = documents.get(&url) {
+            self.admit(&document)?;
+            // An id on its root may give the document another URL.
+            return Ok(self.scope(document.root).cloned().unwrap_or(document));
+        }
+        if let Some(holder) = documents.holding(&url) {
+            self.admit(&holder)?;
+            if let Some(resource) = self.resources.get(&url) {
+                return Ok(resource.clone());
+            }
+        }
+        Err(Error::MissingDocument { url })
+    }
+
     fn start(
-        &self,
-        within: Document<'doc>,
+        &mut self,
+        within: &Document<'doc>,
         reference: &'doc str,
         active: &mut BTreeSet<Written<'doc>>,
     ) -> Result<Walk<'doc>, Error> {
         let (location, fragment) = split(reference);
-        let document = match (location, self.documents) {
-            ("", _) => within,
-            (_, Some(documents)) => documents.find(within.url, location)?,
-            (_, None) => {
-                return Err(Error::ExternalReference {
-                    reference: reference.to_owned(),
-                });
-            }
+        let resource = if location.is_empty() {
+            within.clone()
+        } else {
+            self.resource(within, reference, location)?
         };
-        let tokens = pointer::tokens(fragment).map_err(|cause| Error::UnresolvedReference {
-            reference: reference.to_owned(),
-            cause,
-        })?;
+        // A fragment that is not a pointer may be a name an id gave a value.
+        let named = match &resource.url {
+            Some(url) if !fragment.is_empty() && !fragment.starts_with('/') => {
+                self.names.get(&format!("{url}#{fragment}")).copied()
+            }
+            Some(_) | None => None,
+        };
+        let (current, tokens) = match named {
+            Some(value) => (value, Vec::new()),
+            None => (
+                resource.root,
+                pointer::tokens(fragment).map_err(|cause| Error::UnresolvedReference {
+                    reference: reference.to_owned(),
+                    cause,
+                })?,
+            ),
+        };
         let key = written(within, reference);
         active.insert(key);
         Ok(Walk {
             key,
-            current: document.root,
-            within: document,
+            current,
+            within: self.scope(current).cloned().unwrap_or(resource),
             tokens: tokens.into_iter().peekable(),
             passed: BTreeSet::new(),
         })
@@ -288,7 +384,7 @@ impl<'doc> References<'doc> {
                 .or_insert_with(|| {
                     Rc::new(Target {
                         value: walk.current,
-                        document: walk.within,
+                        document: walk.within.clone(),
                         cycle: Cell::new(None),
                         leads_to_cycle: Cell::new(false),
                         visit: Cell::new(Visit::Unvisited),
@@ -303,16 +399,26 @@ impl<'doc> References<'doc> {
     /// to the innermost target that encloses it.
     fn successors(&self, root: &'doc Value, successors: &mut Successors<'doc>) {
         let mut open = Vec::new();
+        // The roots of the resources the walk is inside, innermost last.
+        let mut within = vec![ptr::from_ref(root)];
         let mut steps = vec![Step::Enter(root)];
         while let Some(step) = steps.pop() {
             let value = match step {
                 Step::Enter(value) => value,
-                Step::Leave => {
+                Step::LeaveTarget => {
                     open.pop();
+                    continue;
+                }
+                Step::LeaveResource => {
+                    within.pop();
                     continue;
                 }
             };
             let address = ptr::from_ref(value);
+            if self.scopes.contains_key(&address) && !ptr::eq(value, root) {
+                within.push(address);
+                steps.push(Step::LeaveResource);
+            }
             if let Some(target) = self.by_address.get(&address) {
                 if let Some(enclosing) = open.last() {
                     successors
@@ -321,10 +427,11 @@ impl<'doc> References<'doc> {
                         .push(Rc::clone(target));
                 }
                 open.push(address);
-                steps.push(Step::Leave);
+                steps.push(Step::LeaveTarget);
             }
             let referenced = reference_of(value)
-                .and_then(|reference| self.by_reference.get(&(ptr::from_ref(root), reference)));
+                .zip(within.last())
+                .and_then(|(reference, resource)| self.by_reference.get(&(*resource, reference)));
             if let (Some(enclosing), Some(referenced)) = (open.last(), referenced) {
                 successors
                     .entry(*enclosing)

@@ -2,9 +2,12 @@
 
 use alloc::borrow::ToOwned;
 use alloc::collections::{BTreeMap, BTreeSet};
-use alloc::rc::{Rc, Weak};
+use alloc::rc::Rc;
+#[cfg(feature = "wasm")]
+use alloc::rc::Weak;
 use alloc::string::String;
 use alloc::vec::Vec;
+#[cfg(feature = "wasm")]
 use core::cell::OnceCell;
 use core::convert::Infallible;
 use core::ptr;
@@ -15,7 +18,9 @@ use serde_json::{Map, Value};
 use crate::documents::{Document, Documents};
 use crate::error::Error;
 use crate::references::{CycleId, References, Target};
-use crate::shared::{Anchor, Back, Merged, Shared};
+#[cfg(feature = "wasm")]
+use crate::shared::Back;
+use crate::shared::{Anchor, Merged, Shared};
 use crate::walk::{REFERENCE_KEY, reference_of};
 
 /// The memory a value takes inside its parent.
@@ -277,7 +282,7 @@ pub fn dereference_schema_shared<'doc>(
         root: schema,
         url: None,
     };
-    let (shared, bytes) = expand(root, None, options, Form::Written)?;
+    let (shared, bytes) = expand(&root, None, options, Form::Written)?;
     if bytes > options.max_bytes {
         return Err(Error::SizeLimitExceeded {
             limit: options.max_bytes,
@@ -290,20 +295,15 @@ pub fn dereference_schema_shared<'doc>(
 /// into `documents` if there are any, and measures the memory it would take
 /// written out as a tree.
 pub(crate) fn expand<'doc>(
-    root: Document<'doc>,
+    root: &Document<'doc>,
     documents: Option<&'doc Documents>,
     options: &Options,
     form: Form,
 ) -> Result<(SharedSchema<'doc>, usize), Error> {
-    let linking = match (form, options.circular) {
-        (Form::Linked, CircularPolicy::Link) => true,
-        (
-            Form::Linked | Form::Written,
-            CircularPolicy::Link
-            | CircularPolicy::Expand
-            | CircularPolicy::Ignore
-            | CircularPolicy::Reject,
-        ) => false,
+    let linking = match form {
+        #[cfg(feature = "wasm")]
+        Form::Linked => options.circular == CircularPolicy::Link,
+        Form::Written => false,
     };
     let mut expansion = Expansion {
         references: References::analyze(root, documents, options)?,
@@ -311,6 +311,7 @@ pub(crate) fn expand<'doc>(
         linking,
         bytes_left: options.max_bytes,
         inlined: BTreeMap::new(),
+        #[cfg(feature = "wasm")]
         expanding: BTreeMap::new(),
         circular: BTreeSet::new(),
     };
@@ -332,6 +333,7 @@ pub(crate) enum Form {
     /// A tree or text, which holds a copy of a target at every reference.
     Written,
     /// Objects that refer to one another, which can hold a cycle.
+    #[cfg(feature = "wasm")]
     Linked,
 }
 
@@ -358,11 +360,9 @@ impl<'doc> Measured<'doc> {
     fn is(&self, value: &Value) -> bool {
         match &self.shared {
             Shared::Original(original) => ptr::eq(*original, value),
-            Shared::Array(_)
-            | Shared::Object(_)
-            | Shared::Inlined(_)
-            | Shared::Merged(_)
-            | Shared::Back(_) => false,
+            Shared::Array(_) | Shared::Object(_) | Shared::Inlined(_) | Shared::Merged(_) => false,
+            #[cfg(feature = "wasm")]
+            Shared::Back(_) => false,
         }
     }
 }
@@ -400,6 +400,7 @@ struct Expansion<'doc, 'options> {
     inlined: BTreeMap<*const Value, Measured<'doc>>,
     /// The targets being expanded right now, each with the place its
     /// finished expansion goes for the links back to it.
+    #[cfg(feature = "wasm")]
     expanding: BTreeMap<*const Value, Rc<OnceCell<Weak<Anchor<'doc>>>>>,
     circular: BTreeSet<&'doc str>,
 }
@@ -429,7 +430,7 @@ impl<'doc> Expansion<'doc, '_> {
     fn value(
         &mut self,
         node: &'doc Value,
-        within: Document<'doc>,
+        within: &Document<'doc>,
         enclosing: Option<CycleId>,
         depth_left: usize,
     ) -> Result<Measured<'doc>, Error> {
@@ -462,7 +463,9 @@ impl<'doc> Expansion<'doc, '_> {
                 Err(self.too_deep())
             };
         }
+        #[cfg(feature = "wasm")]
         let link = Rc::new(OnceCell::new());
+        #[cfg(feature = "wasm")]
         self.expanding.insert(address, Rc::clone(&link));
         let expanded = self.expand(
             target.value(),
@@ -470,6 +473,7 @@ impl<'doc> Expansion<'doc, '_> {
             target.cycle(),
             depth_left,
         );
+        #[cfg(feature = "wasm")]
         self.expanding.remove(&address);
         let mut expanded = expanded?;
         expanded.shared = match expanded.shared {
@@ -478,12 +482,15 @@ impl<'doc> Expansion<'doc, '_> {
             Shared::Original(
                 value @ (Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)),
             ) => Shared::Original(value),
-            shared @ (Shared::Inlined(_) | Shared::Back(_)) => shared,
+            shared @ Shared::Inlined(_) => shared,
+            #[cfg(feature = "wasm")]
+            shared @ Shared::Back(_) => shared,
             shared @ (Shared::Original(Value::Array(_) | Value::Object(_))
             | Shared::Array(_)
             | Shared::Object(_)
             | Shared::Merged(_)) => Shared::Inlined(Rc::new(Anchor { value: shared })),
         };
+        #[cfg(feature = "wasm")]
         if let Shared::Inlined(anchor) = &expanded.shared {
             link.get_or_init(|| Rc::downgrade(anchor));
         }
@@ -498,13 +505,17 @@ impl<'doc> Expansion<'doc, '_> {
     fn expand(
         &mut self,
         node: &'doc Value,
-        within: Document<'doc>,
+        within: &Document<'doc>,
         enclosing: Option<CycleId>,
         depth_left: usize,
     ) -> Result<Measured<'doc>, Error> {
         let Some(depth_left) = depth_left.checked_sub(1) else {
             return Err(self.too_deep());
         };
+        // An id makes the value a resource of its own, which the references
+        // inside it are relative to.
+        let scope = self.references.scope(node).cloned();
+        let within = scope.as_ref().unwrap_or(within);
         match node {
             Value::Object(members) => match reference_of(node) {
                 Some(reference) => {
@@ -548,7 +559,7 @@ impl<'doc> Expansion<'doc, '_> {
         &mut self,
         node: &'doc Value,
         members: &'doc Map<String, Value>,
-        within: Document<'doc>,
+        within: &Document<'doc>,
         enclosing: Option<CycleId>,
         depth_left: usize,
     ) -> Result<Measured<'doc>, Error> {
@@ -587,11 +598,12 @@ impl<'doc> Expansion<'doc, '_> {
         node: &'doc Value,
         members: &'doc Map<String, Value>,
         reference: &'doc str,
-        within: Document<'doc>,
+        within: &Document<'doc>,
         enclosing: Option<CycleId>,
         depth_left: usize,
     ) -> Result<Measured<'doc>, Error> {
         let target = self.references.target(within, reference)?;
+        #[cfg(feature = "wasm")]
         if let Some(link) = self.expanding.get(&ptr::from_ref(target.value()))
             && self.linking
         {

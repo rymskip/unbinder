@@ -191,6 +191,12 @@ names the local machine or a private network, and only from the origin of the
 URL you gave it. Redirects are held to the same rules, and it stops reading
 once the documents pass `maxBytes`. To load anything else, pass a resolver.
 
+An `$id` gives a document, or a part of one, a URL of its own that references
+can use, and makes pointers inside that part start at it. As in
+json-schema-ref-parser, ids are followed in a document whose root has one or
+names a draft of JSON Schema that defines them. Draft 4's `id` is read the
+same way.
+
 ### Circular references
 
 A tree and text cannot hold a cycle, so there a reference that takes part in
@@ -440,7 +446,7 @@ Run it with `pixi run bench`.
 -   A sibling of a `$ref` whose target is not an object is dropped.
 -   Every object with a string `$ref` member is treated as a reference,
     including one inside `enum`, `const`, `default` or `examples`.
--   `$id`, `$anchor` and `$dynamicRef` are not interpreted.
+-   `$anchor` and `$dynamicRef` are not interpreted.
 -   Dereferencing a recursive schema twice expands its cycles a second level.
 
 ## Upgrading from 0.1

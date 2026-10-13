@@ -8,8 +8,11 @@
 
 use alloc::borrow::ToOwned;
 use alloc::collections::BTreeMap;
-use alloc::rc::{Rc, Weak};
+use alloc::rc::Rc;
+#[cfg(feature = "wasm")]
+use alloc::rc::Weak;
 use alloc::vec::Vec;
+#[cfg(feature = "wasm")]
 use core::cell::OnceCell;
 use core::convert::Infallible;
 
@@ -30,7 +33,9 @@ pub(crate) enum Shared<'doc> {
     /// An object with the keywords next to a reference merged over it.
     Merged(Rc<Merged<'doc>>),
     /// A reference to a target that was still being expanded when the
-    /// reference was reached, which closes a cycle.
+    /// reference was reached, which closes a cycle. Only an output made of
+    /// objects that refer to one another can hold one.
+    #[cfg(feature = "wasm")]
     Back(Back<'doc>),
 }
 
@@ -41,6 +46,7 @@ pub(crate) struct Anchor<'doc> {
 }
 
 /// A link back to an expansion that contains it.
+#[cfg(feature = "wasm")]
 #[derive(Clone, Debug)]
 pub(crate) struct Back<'doc> {
     /// The expansion, once it is finished. Held weakly, because the
@@ -50,6 +56,7 @@ pub(crate) struct Back<'doc> {
     pub(crate) written: &'doc Value,
 }
 
+#[cfg(feature = "wasm")]
 impl<'doc> Back<'doc> {
     /// The expansion this links back to, while it is alive.
     pub(crate) fn target(&self) -> Option<Rc<Anchor<'doc>>> {
@@ -94,7 +101,9 @@ impl<'doc> Shared<'doc> {
         match self {
             Self::Original(value) => value.is_object(),
             Self::Object(_) | Self::Merged(_) => true,
-            Self::Array(_) | Self::Back(_) => false,
+            Self::Array(_) => false,
+            #[cfg(feature = "wasm")]
+            Self::Back(_) => false,
             Self::Inlined(anchor) => anchor.value.is_object(),
         }
     }
@@ -103,7 +112,9 @@ impl<'doc> Shared<'doc> {
     /// where they are kept in a list, and none where they are indexed.
     pub(crate) fn scan(&self) -> usize {
         match self {
-            Self::Original(_) | Self::Array(_) | Self::Back(_) => 0,
+            Self::Original(_) | Self::Array(_) => 0,
+            #[cfg(feature = "wasm")]
+            Self::Back(_) => 0,
             Self::Object(members) => members.len(),
             Self::Inlined(anchor) => anchor.value.scan(),
             Self::Merged(merged) => merged.base.scan(),
@@ -114,7 +125,9 @@ impl<'doc> Shared<'doc> {
     pub(crate) fn width(&self) -> usize {
         match self {
             Self::Original(value) => value.as_object().map_or(0, Map::len),
-            Self::Array(_) | Self::Back(_) => 0,
+            Self::Array(_) => 0,
+            #[cfg(feature = "wasm")]
+            Self::Back(_) => 0,
             Self::Object(members) => members.len(),
             Self::Inlined(anchor) => anchor.value.width(),
             Self::Merged(merged) => merged.base.width().saturating_add(merged.overrides.len()),
@@ -129,7 +142,9 @@ impl<'doc> Shared<'doc> {
                 .iter()
                 .find(|(held, _)| *held == name)
                 .map(|(_, member)| member.clone()),
-            Self::Array(_) | Self::Back(_) => None,
+            Self::Array(_) => None,
+            #[cfg(feature = "wasm")]
+            Self::Back(_) => None,
             Self::Inlined(anchor) => anchor.value.member(name),
             Self::Merged(merged) => merged
                 .overridden(name)
@@ -155,7 +170,9 @@ impl<'doc> Shared<'doc> {
             Self::Object(members) => members
                 .iter()
                 .try_for_each(|(name, member)| visit(name, member)),
-            Self::Array(_) | Self::Back(_) => Ok(()),
+            Self::Array(_) => Ok(()),
+            #[cfg(feature = "wasm")]
+            Self::Back(_) => Ok(()),
             Self::Inlined(anchor) => anchor.value.members(visit),
             Self::Merged(merged) => {
                 merged
@@ -193,6 +210,7 @@ impl<'doc> Shared<'doc> {
                 });
                 Value::Object(members)
             }
+            #[cfg(feature = "wasm")]
             Self::Back(back) => back.written.clone(),
         }
     }
@@ -212,6 +230,7 @@ impl Serialize for Shared<'_> {
                 self.members(&mut |name, member| map.serialize_entry(name, member))?;
                 map.end()
             }
+            #[cfg(feature = "wasm")]
             Self::Back(back) => back.written.serialize(format),
         }
     }

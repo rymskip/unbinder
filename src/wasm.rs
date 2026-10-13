@@ -222,7 +222,7 @@ pub fn dereference_schema(
         root: &schema,
         url: None,
     };
-    linked(root, None, &options)
+    linked(&root, None, &options)
 }
 
 /// Loads the document at `url` and every document its references lead to,
@@ -294,13 +294,15 @@ pub async fn dereference_schema_from(
             }
         }
     }
-    let root = documents.find(None, &root).map_err(thrown)?;
-    linked(root, Some(&documents), &options)
+    let Some(document) = documents.get(&root) else {
+        return Err(thrown(Error::MissingDocument { url: root }));
+    };
+    linked(&document, Some(&documents), &options)
 }
 
 /// Dereferences `root` and hands the result to JavaScript as shared objects.
 fn linked(
-    root: Document<'_>,
+    root: &Document<'_>,
     documents: Option<&Documents>,
     options: &Options,
 ) -> Result<Ts<Dereferenced>, JsValue> {

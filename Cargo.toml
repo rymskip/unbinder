@@ -1,7 +1,7 @@
 [package]
 name = "unbinder"
-version = "0.1.7"
-edition = "2021"
+version = "0.2.0"
+edition = "2024"
 authors = ["rymskip <38576440+rymskip@users.noreply.github.com>"]
 description = "A high-performance JSON Schema dereferencer for resolving $ref pointers"
 documentation = "https://docs.rs/unbinder"
@@ -11,65 +11,119 @@ license = "MIT"
 readme = "README.md"
 keywords = ["json-schema", "dereference", "ref", "wasm", "no-std"]
 categories = ["web-programming", "wasm", "no-std", "parser-implementations"]
+exclude = [
+    "/.dockerignore",
+    "/bench",
+    "/bun.lock",
+    "/package.json",
+    "/pixi.lock",
+    "/pixi.toml",
+    "/scripts",
+    "/tests/js",
+]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
-[package.metadata.wasm-pack.profile.release]
-wasm-opt = true
-
-[package.metadata.wasm-pack]
-name = "unbinder"
-
-# ── core ──────────────────────────────────────────────
 [dependencies]
-rustc-hash = "2.1"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-cfg-if = "1.0.1"
-
-# ── wasm glue (conditional) ──────────────────────────────
-serde-wasm-bindgen = { version = "0.6", optional = true }
-js-sys = { version = "0.3", optional = true }
-web-sys = { version = "0.3", optional = true, features = [
-    "console",
-    "Performance",
+percent-encoding = { version = "2.3.2", default-features = false, features = [
+    "alloc",
 ] }
-wasm-bindgen = { version = "0.2", optional = true, features = [
-    "serde-serialize",
+serde_json = { version = "1.0.154", default-features = false, features = [
+    "alloc",
 ] }
-wasm-bindgen-rayon = { version = "1.3", optional = true }
-console_error_panic_hook = { version = "0.1", optional = true }
 
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-wee_alloc = { version = "0.4", optional = true }
+serde = { version = "1.0.229", default-features = false, features = [
+    "alloc",
+] }
 
-# ── features ──────────────────────────────────────────
+# ── JavaScript bindings ───────────────────────────────
+js-sys = { version = "0.3.106", optional = true }
+tsify = { version = "0.5.8", default-features = false, features = [
+    "js",
+], optional = true }
+wasm-bindgen = { version = "0.2.129", optional = true }
+
+[dev-dependencies]
+proptest = "1.12.0"
+
 [features]
 default = ["std"]
-std = []
+std = ["percent-encoding/std", "serde/std", "serde_json/std"]
 wasm = [
-    "dep:wasm-bindgen",
-    "dep:js-sys",
-    "dep:web-sys",
-    "dep:serde-wasm-bindgen",
-]
-wee_alloc = ["dep:wee_alloc"]
-console_log = ["wasm", "dep:web-sys"] # Fixed: use dep:web-sys
-console_error_panic_hook = ["dep:console_error_panic_hook"]
-text-interface = ["wasm"]
-parallel = [
     "std",
-    "dep:wasm-bindgen-rayon",
-    "wasm",
-] # Fixed: use dep:wasm-bindgen-rayon
-dev = [
-    "dep:console_error_panic_hook",
-    "console_log",
-] # Fixed: use dep:console_error_panic_hook
+    "dep:js-sys",
+    "serde/derive",
+    "dep:tsify",
+    "dep:wasm-bindgen",
+]
 
-# ── release profile ───────────────────────────────────
+[[bench]]
+name = "native"
+harness = false
+
 [profile.release]
-opt-level = "s"
 lto = true
 panic = "abort"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "deny"
+missing_docs = "deny"
+rust_2018_idioms = { level = "deny", priority = -1 }
+trivial_casts = "deny"
+trivial_numeric_casts = "deny"
+unnameable_types = "deny"
+unreachable_pub = "deny"
+unused_lifetimes = "deny"
+unused_qualifications = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+
+# No panics outside a proven invariant.
+expect_used = "deny"
+get_unwrap = "deny"
+indexing_slicing = "deny"
+panic = "deny"
+panic_in_result_fn = "deny"
+string_slice = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+unwrap_in_result = "deny"
+unwrap_used = "deny"
+
+# No failure turned into absence. `clippy.toml` bans the methods that do it.
+let_underscore_must_use = "deny"
+map_err_ignore = "deny"
+unused_result_ok = "deny"
+
+# Numeric conversions and overflow are explicit.
+arithmetic_side_effects = "deny"
+as_conversions = "deny"
+
+# A new variant must be handled at every match.
+wildcard_enum_match_arm = "deny"
+
+# Names say what they hold. `clippy.toml` removes the single-letter allowance.
+min_ident_chars = "deny"
+single_char_lifetime_names = "deny"
+
+# A suppression is an `#[expect]` with a reason, so it expires.
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+
+# The crate builds without `std`.
+alloc_instead_of_core = "deny"
+std_instead_of_alloc = "deny"
+std_instead_of_core = "deny"
+
+clone_on_ref_ptr = "deny"
+dbg_macro = "deny"
+exit = "deny"
+infinite_loop = "deny"
+mem_forget = "deny"
+print_stderr = "deny"
+print_stdout = "deny"

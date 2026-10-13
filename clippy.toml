@@ -1,0 +1,7 @@
+allowed-idents-below-min-chars = []
+
+disallowed-methods = [
+    { path = "core::result::Result::ok", reason = "turns a failure into absence; match on the error" },
+    { path = "core::result::Result::unwrap_or", reason = "turns a failure into a fallback; match on the error" },
+    { path = "core::result::Result::unwrap_or_default", reason = "turns a failure into a default; match on the error" },
+]

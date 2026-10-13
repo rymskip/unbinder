@@ -1,0 +1,5 @@
+[toolchain]
+channel = "1.99.0"
+components = ["clippy", "rustfmt"]
+# `thumbv7em-none-eabihf` has no `std`, so building for it proves `no_std`.
+targets = ["wasm32-unknown-unknown", "thumbv7em-none-eabihf"]

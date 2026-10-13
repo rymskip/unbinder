@@ -165,7 +165,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 In JavaScript, `dereferenceSchemaFrom` does the loading. It fetches each
-document as JSON unless it is given another way to get one:
+document and reads it as JSON or YAML, unless it is given another way to get
+one:
 
 ```javascript
 import init, { dereferenceSchemaFrom } from "unbinder";
@@ -432,6 +433,10 @@ Run it with `pixi run bench`.
     JavaScript package always has it.
 -   `wasm`: the JavaScript bindings. Off by default, so a Rust program that
     targets WebAssembly does not export them.
+-   `yaml`: lets `dereferenceSchemaFrom` read YAML documents as well as JSON.
+    The published JavaScript package is built with it. The YAML parser is
+    most of that module's size, so a build without it is about a third as
+    large.
 
 ## Limitations
 

@@ -402,6 +402,41 @@ test("fetches documents when given no resolver", async () => {
   assert.equal(calls, 3);
 });
 
+test("the default loader reads YAML", async () => {
+  const yaml: Record<string, string> = {
+    "https://example.com/api/root.yaml": [
+      "title: Root",
+      "responses:",
+      "  200:",
+      "    $ref: 'parts.yaml#/ok'",
+      "",
+    ].join("\n"),
+    "https://example.com/api/parts.yaml": [
+      "ok:",
+      "  description: Fine",
+      "  tags: [a, b]",
+      "  nullable: false",
+      "",
+    ].join("\n"),
+  };
+
+  await withFetch(
+    (url) => new Response(yaml[url]),
+    async () => {
+      const { schema } = await dereferenceSchemaFrom(
+        "https://example.com/api/root.yaml",
+      );
+
+      assert.deepEqual(schema, {
+        title: "Root",
+        responses: {
+          "200": { description: "Fine", tags: ["a", "b"], nullable: false },
+        },
+      });
+    },
+  );
+});
+
 test("the default loader refuses local and private addresses", async () => {
   const refused = [
     "http://localhost/schema.json",

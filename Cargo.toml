@@ -42,6 +42,9 @@ serde = { version = "1.0.229", default-features = false, features = [
 
 # ── JavaScript bindings ───────────────────────────────
 js-sys = { version = "0.3.106", optional = true }
+serde-saphyr = { version = "2.0.0", default-features = false, features = [
+    "deserialize",
+], optional = true }
 wasm-bindgen-futures = { version = "0.4.79", optional = true }
 tsify = { version = "0.5.8", default-features = false, features = [
     "js",
@@ -54,6 +57,9 @@ proptest = "1.12.0"
 [features]
 default = ["std"]
 std = ["fluent-uri/std", "percent-encoding/std", "serde/std", "serde_json/std"]
+# Lets the JavaScript loader read YAML as well as JSON. The parser is most of
+# the size of a module built with it.
+yaml = ["wasm", "dep:serde-saphyr"]
 # Keeps the members of an object in the order the document has them.
 preserve_order = ["std", "serde_json/preserve_order"]
 wasm = [

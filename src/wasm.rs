@@ -233,7 +233,8 @@ pub fn dereference_schema(
 /// the document or a promise of it. References in a document are relative to
 /// its own URL.
 ///
-/// Without `resolve`, each document is fetched as JSON, under rules that
+/// Without `resolve`, each document is fetched and read as JSON, or as YAML
+/// in a build that has it, under rules that
 /// bound what a document can make it fetch: only `http:` and `https:` URLs,
 /// never one that names this machine or a private network, and only from the
 /// origin of `url`. Redirects are held to the same rules. Pass a `resolve`
@@ -285,7 +286,10 @@ pub async fn dereference_schema_from(
                 limit: options.max_bytes,
             })
         })?;
-        let document = serde_json::from_str(&text).map_err(thrown)?;
+        let document = match &resolve {
+            Some(_) => serde_json::from_str(&text).map_err(thrown)?,
+            None => read(&text, &options)?,
+        };
         // Only what this document refers to is new, so only that is looked
         // at, however many documents came before.
         for referred in documents.add(&next, document).map_err(thrown)? {
@@ -345,6 +349,38 @@ pub fn schema_stats(schema: &JsValue) -> Result<Ts<Stats>, JsValue> {
     let schema: Value = serde_json::from_str(&json_of(schema)?).map_err(thrown)?;
     let stats = serde_json::to_string(&Stats::of(&schema)).map_err(thrown)?;
     Ok(Ts::new_unchecked(JSON::parse(&stats)?))
+}
+
+/// Reads a document the default loader fetched, which is JSON.
+#[cfg(not(feature = "yaml"))]
+fn read(text: &str, _: &Options) -> Result<Value, JsValue> {
+    serde_json::from_str(text).map_err(thrown)
+}
+
+/// Reads a document the default loader fetched, which is JSON or YAML.
+#[cfg(feature = "yaml")]
+fn read(text: &str, options: &Options) -> Result<Value, JsValue> {
+    let json = match serde_json::from_str(text) {
+        Ok(document) => return Ok(document),
+        Err(error) => error,
+    };
+    // A document has no more values than it has bytes, so the YAML reader's
+    // limits follow the text, which is itself limited.
+    let limits = serde_saphyr::options! {
+        budget: serde_saphyr::budget! {
+            max_depth: options.max_depth,
+            max_nodes: text.len(),
+            max_events: text.len().saturating_mul(2),
+            max_total_scalar_bytes: text.len(),
+        },
+    };
+    match serde_saphyr::from_str_with_options(text, limits) {
+        Ok(document) => Ok(document),
+        // Text that opens like JSON was meant as JSON, so that reader's
+        // complaint is the one to pass on.
+        Err(_) if text.trim_start().starts_with(['{', '[']) => Err(thrown(json)),
+        Err(error) => Err(thrown(error)),
+    }
 }
 
 /// The result as it is written to JSON text.

@@ -9,7 +9,7 @@ const pkg = new URL("pkg/", root);
 
 execFileSync(
   "wasm-pack",
-  ["build", "--target", "web", "--", "--features", "wasm"],
+  ["build", "--target", "web", "--", "--features", "yaml"],
   { cwd: root, stdio: "inherit" },
 );
 

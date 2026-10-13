@@ -1,0 +1,77 @@
+[workspace]
+channels = [
+    "conda-forge",
+    # rustup with its toolchain proxies.
+    "https://prefix.dev/rymskip/theedstow",
+    # Bun. conda-forge's cannot be installed next to Node.js 26.
+    "https://prefix.dev/brads-forge",
+]
+name = "unbinder"
+platforms = ["osx-64", "linux-64"]
+
+[activation.env]
+# One toolchain install shared with the global rustup and with other repos.
+RUSTUP_HOME = "$HOME/.pixi/envs/rustup/.rustup"
+
+[tasks]
+# --- check -----------------------------------------------------------------
+
+"fmt:check" = "cargo fmt --check"
+lint = "cargo clippy --all-targets --all-features"
+"lint:wasm" = "cargo clippy --lib --all-features --target wasm32-unknown-unknown"
+# Builds the library for a target that has no standard library. Only the rlib,
+# because that target cannot link the cdylib the manifest also asks for.
+"build:no-std" = "cargo rustc --lib --crate-type rlib --no-default-features --target thumbv7em-none-eabihf"
+
+# --- test ------------------------------------------------------------------
+
+"test:rust" = "cargo test --all-features"
+"install:js" = "bun install --frozen-lockfile"
+# Builds pkg/, the package published to npm and JSR.
+"build:js" = "bun run build"
+# Builds pkg/, checks the tests against its TypeScript declarations and runs
+# them in Node.
+"test:js" = { cmd = "bun run test", depends-on = ["install:js"] }
+test = { depends-on = ["test:rust", "test:js"] }
+verify = { depends-on = [
+    "fmt:check",
+    "lint",
+    "lint:wasm",
+    "build:no-std",
+    "test:rust",
+    "test:js",
+] }
+
+# --- publish ---------------------------------------------------------------
+
+"publish:npm" = { cmd = "bun run publish:npm", depends-on = ["install:js"] }
+"publish:jsr" = { cmd = "bun run publish:jsr", depends-on = ["install:js"] }
+
+# --- benchmark -------------------------------------------------------------
+
+# Compares unbinder with @apidevtools/json-schema-ref-parser in a container
+# built from this environment.
+bench = "docker build --file bench/Dockerfile --tag unbinder-bench . && docker run --rm unbinder-bench"
+"bench:install" = { cmd = "bun install --frozen-lockfile", cwd = "bench" }
+# Writes the synthetic documents and downloads the pinned real ones.
+"bench:fixtures" = "node bench/prepare-fixtures.js"
+"bench:build" = "cargo bench --bench native --no-run"
+# The comparison itself, on this machine.
+"bench:run" = { cmd = "node --expose-gc --max-old-space-size=8192 bench/run.js", depends-on = [
+    "build:js",
+    "bench:install",
+    "bench:fixtures",
+    "bench:build",
+] }
+
+[dependencies]
+# The toolchain itself is pinned in rust-toolchain.toml, and rustup installs
+# it on the first cargo invocation.
+rustup = ">=1.29.1,<2"
+nodejs = ">=26.10.0,<26.11"
+wasm-pack = ">=0.15.0,<0.16"
+# wasm-opt, which wasm-pack runs on the module.
+binaryen = ">=121,<122"
+# Has to match the wasm-bindgen crate in Cargo.lock exactly.
+wasm-bindgen-cli = "==0.2.129"
+bun = { version = ">=1.4.3,<2", channel = "https://prefix.dev/brads-forge" }

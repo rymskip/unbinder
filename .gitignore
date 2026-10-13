@@ -22,3 +22,7 @@ target/
 # JavaScript tooling and the built npm package
 node_modules/
 /pkg/
+/bench/fixtures/
+
+# pixi environments
+.pixi/

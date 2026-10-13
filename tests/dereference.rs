@@ -501,6 +501,48 @@ fn rejects_an_external_reference() {
 }
 
 #[test]
+fn rejects_a_reference_that_would_become_a_new_reference() {
+    let schema = json!({
+        "holder": { "$ref": { "$ref": "#/elsewhere" } },
+        "elsewhere": "https://example.com/unresolved.json"
+    });
+
+    for circular in [
+        CircularPolicy::Link,
+        CircularPolicy::Expand,
+        CircularPolicy::Ignore,
+        CircularPolicy::Reject,
+    ] {
+        let options = Options {
+            circular,
+            ..Options::default()
+        };
+
+        assert_eq!(
+            dereference_schema_with(&schema, &options),
+            Err(Error::ReferenceToReference {
+                reference: "#/elsewhere".to_owned()
+            })
+        );
+    }
+}
+
+#[test]
+fn inlines_an_object_under_the_name_of_a_reference() {
+    let schema = json!({
+        "properties": { "$ref": { "$ref": "#/definitions/uri" } },
+        "definitions": { "uri": { "type": "string", "format": "uri-reference" } }
+    });
+
+    assert_eq!(
+        member(&schema, "properties"),
+        Ok(Some(
+            json!({ "$ref": { "type": "string", "format": "uri-reference" } })
+        ))
+    );
+}
+
+#[test]
 fn reports_a_pointer_without_a_leading_slash() {
     assert_eq!(
         target_of("#definitions/name"),

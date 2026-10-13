@@ -236,6 +236,7 @@ proptest! {
                 | Error::UnresolvedReference { .. }
                 | Error::InvalidUrl { .. }
                 | Error::MissingDocument { .. }
+                | Error::ReferenceToReference { .. }
                 | Error::DocumentLimitExceeded { .. }
                 | Error::DepthLimitExceeded { .. }
                 | Error::SizeLimitExceeded { .. }),

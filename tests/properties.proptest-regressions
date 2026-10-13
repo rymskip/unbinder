@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc f175b1305b13141dee93fed33a1e7f3b2a47dcf165bf367d98818877204d4ac3 # shrinks to graph = [[0], [0]]
+cc ac91ec2aa2f21b5bb44d7abe31fa0c06f1959b6d929b01e6e18e66a4c25610ac # shrinks to document = Object {"$ref": Object {"$ref": String("#/b/a")}, "b": Object {"a": String("#")}}

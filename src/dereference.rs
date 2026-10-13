@@ -610,6 +610,16 @@ impl<'doc> Expansion<'doc, '_> {
         let mut changed: Option<Vec<(&'doc str, Shared<'doc>)>> = None;
         for (position, (name, member)) in members.iter().enumerate() {
             let child = self.value(member, within, enclosing, depth_left)?;
+            // A string under this name is a reference, and this one would be
+            // one that was never written and never resolved.
+            if name == REFERENCE_KEY
+                && let Some(reference) = reference_of(member)
+                && matches!(child.shared, Shared::Original(Value::String(_)))
+            {
+                return Err(Error::ReferenceToReference {
+                    reference: reference.to_owned(),
+                });
+            }
             totals.add(&child, NAME_BYTES.saturating_add(name.len()));
             if let Some(expanded) = &mut changed {
                 expanded.push((name, child.shared));

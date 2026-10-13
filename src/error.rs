@@ -40,6 +40,13 @@ pub enum Error {
         /// The reference that closes the cycle.
         reference: String,
     },
+    /// A reference written under the name `$ref` points at a string.
+    /// Inlining it would make the object that holds it a reference, one the
+    /// document does not have and nothing has resolved.
+    ReferenceToReference {
+        /// The reference as written in the document.
+        reference: String,
+    },
     /// The output nests deeper than [`Options::max_depth`], or a pointer
     /// passes through more references than that.
     ///
@@ -83,6 +90,12 @@ impl fmt::Display for Error {
             }
             Self::CircularReference { reference } => {
                 write!(formatter, "reference `{reference}` is circular")
+            }
+            Self::ReferenceToReference { reference } => {
+                write!(
+                    formatter,
+                    "reference `{reference}` would put a string under `$ref` and make a new reference"
+                )
             }
             Self::DepthLimitExceeded { limit } => {
                 write!(formatter, "depth limit of {limit} levels exceeded")

@@ -122,6 +122,75 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+### References to other documents
+
+A reference may point into another document, by a URL that is absolute or
+relative to the document it is written in. `Documents` holds the documents by
+URL and says which ones are still to load; loading them is up to you, so the
+crate reads no files and opens no connections.
+
+```rust
+use std::collections::BTreeMap;
+
+use serde_json::{Value, json};
+use unbinder::{Documents, Options};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Stands in for a disk or a network.
+    let files = BTreeMap::from([
+        (
+            "https://example.com/schemas/order.json",
+            json!({ "customer": { "$ref": "customer.json#/definitions/name" } }),
+        ),
+        (
+            "https://example.com/schemas/customer.json",
+            json!({ "definitions": { "name": { "type": "string" } } }),
+        ),
+    ]);
+    let load = |url: &str| -> Result<Value, String> {
+        files.get(url).cloned().ok_or(format!("no document at {url}"))
+    };
+
+    let root = "https://example.com/schemas/order.json";
+    let mut documents = Documents::new();
+    documents.insert(root, load(root)?)?;
+    while let Some(url) = documents.missing().first() {
+        documents.insert(url, load(url)?)?;
+    }
+
+    let order = documents.dereference(root, &Options::default())?;
+    assert_eq!(order.to_value(), json!({ "customer": { "type": "string" } }));
+    Ok(())
+}
+```
+
+In JavaScript, `dereferenceSchemaFrom` does the loading. It fetches each
+document as JSON unless it is given another way to get one:
+
+```javascript
+import init, { dereferenceSchemaFrom } from "unbinder";
+import { readFile } from "node:fs/promises";
+
+await init();
+
+const { schema } = await dereferenceSchemaFrom(
+    "https://example.com/schemas/order.json",
+);
+
+// Or load documents yourself, here from disk.
+const fromDisk = await dereferenceSchemaFrom(
+    new URL("schemas/order.json", import.meta.url).href,
+    {},
+    async (url) => JSON.parse(await readFile(new URL(url), "utf8")),
+);
+```
+
+A document names the URLs it refers to, so the built-in loader bounds what a
+document can make it fetch: only `http:` and `https:` URLs, never one that
+names the local machine or a private network, and only from the origin of the
+URL you gave it. Redirects are held to the same rules, and it stops reading
+once the documents pass `maxBytes`. To load anything else, pass a resolver.
+
 ### Circular references
 
 By default a reference that takes part in a cycle is inlined wherever it is
@@ -178,6 +247,7 @@ fn main() -> Result<(), Error> {
 | `siblings`  | `Deep`   | Merge sibling objects into the target's, or replace them    |
 | `max_depth` | 128      | How deep the output may nest                                |
 | `max_bytes` | 256 MiB  | Roughly how much memory the output may take as a tree       |
+| `max_documents` | 1024 | How many documents the references may lead through          |
 
 With `siblings: Deep`, a sibling `properties` object is merged into the
 target's `properties`, and so on inward. Arrays and other values in a sibling
@@ -258,6 +328,12 @@ The same, with [options](#options) in place of the defaults.
 The same result [without copying](#without-copying). `SharedSchema` implements
 `Serialize`, and `to_value` builds the tree from it.
 
+#### `Documents`
+
+A set of documents that refer to one another: `insert(url, document)`,
+`missing()` for the URLs still to load, and `dereference(url, options)`. See
+[references to other documents](#references-to-other-documents).
+
 #### `Stats::of(schema: &Value) -> Stats`
 
 Counts the `objects`, `arrays` and `references` in a document.
@@ -270,6 +346,7 @@ interface Options {
     siblings?: "deep" | "shallow";
     maxDepth?: number;
     maxBytes?: number;
+    maxDocuments?: number;
 }
 
 interface Dereferenced {
@@ -284,6 +361,11 @@ interface Stats {
 }
 
 function dereferenceSchema(schema: any, options?: Options): Dereferenced;
+function dereferenceSchemaFrom(
+    url: string,
+    options?: Options,
+    resolve?: (url: string) => unknown,
+): Promise<Dereferenced>;
 function dereferenceSchemaText(json: string, options?: Options): string;
 function schemaStats(schema: any): Stats;
 ```
@@ -336,8 +418,11 @@ Run it with `pixi run bench`.
 
 ## Limitations
 
--   Only internal references (starting with `#`) are supported. An external
-    reference is an error.
+-   A reference into another document is followed only through `Documents`
+    or `dereferenceSchemaFrom`. `dereference_schema` and `dereferenceSchema`
+    take one document and report such a reference as an error.
+-   A circular reference left in place inside a document that was loaded
+    stays as written, relative to that document and not to the output.
 -   A pointer that passes through a `$ref` with sibling keywords finds the
     siblings first and the target's members second. It does not see the two
     merged, so it cannot reach into an object that deep merging would combine.

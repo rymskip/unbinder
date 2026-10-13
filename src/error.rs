@@ -6,11 +6,24 @@ use core::fmt;
 /// Why a document could not be dereferenced.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
-    /// A reference points outside the document. Only references that start
-    /// with `#` are supported.
+    /// A reference points outside the document, and the document was
+    /// dereferenced on its own. [`Documents`] follows such references.
+    ///
+    /// [`Documents`]: crate::Documents
     ExternalReference {
         /// The reference as written in the document.
         reference: String,
+    },
+    /// A document is named by something that is not a URL, or by a relative
+    /// URL where there is no absolute one to resolve it against.
+    InvalidUrl {
+        /// The URL as written.
+        url: String,
+    },
+    /// A reference points into a document that is not in the set.
+    MissingDocument {
+        /// The absolute URL of the document.
+        url: String,
     },
     /// A reference points at a location that does not exist in the document.
     UnresolvedReference {
@@ -35,6 +48,14 @@ pub enum Error {
         /// The limit that was in effect.
         limit: usize,
     },
+    /// The references lead through more documents than
+    /// [`Options::max_documents`].
+    ///
+    /// [`Options::max_documents`]: crate::Options::max_documents
+    DocumentLimitExceeded {
+        /// The limit that was in effect.
+        limit: usize,
+    },
     /// The output takes more memory than [`Options::max_bytes`].
     ///
     /// [`Options::max_bytes`]: crate::Options::max_bytes
@@ -53,6 +74,10 @@ impl fmt::Display for Error {
                     "external reference `{reference}` is not supported"
                 )
             }
+            Self::InvalidUrl { url } => write!(formatter, "`{url}` is not a usable URL"),
+            Self::MissingDocument { url } => {
+                write!(formatter, "document `{url}` has not been loaded")
+            }
             Self::UnresolvedReference { reference, cause } => {
                 write!(formatter, "cannot resolve reference `{reference}`: {cause}")
             }
@@ -61,6 +86,12 @@ impl fmt::Display for Error {
             }
             Self::DepthLimitExceeded { limit } => {
                 write!(formatter, "depth limit of {limit} levels exceeded")
+            }
+            Self::DocumentLimitExceeded { limit } => {
+                write!(
+                    formatter,
+                    "references lead through more than {limit} documents"
+                )
             }
             Self::SizeLimitExceeded { limit } => {
                 write!(formatter, "output takes more than {limit} bytes")

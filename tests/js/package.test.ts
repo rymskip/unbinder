@@ -4,6 +4,7 @@ import { test } from "node:test";
 
 import init, {
   dereferenceSchema,
+  dereferenceSchemaFrom,
   dereferenceSchemaText,
   schemaStats,
 } from "../../pkg/unbinder.js";
@@ -241,6 +242,204 @@ test("rejects a document that is not JSON data", () => {
 
   throwsError(() => dereferenceSchema(cyclic), "circular");
   throwsError(() => dereferenceSchema(undefined), "no JSON representation");
+});
+
+const order = "https://example.com/schemas/order.json";
+const files: Record<string, unknown> = {
+  [order]: {
+    properties: {
+      customer: { $ref: "customer.json#/definitions/name" },
+      total: { $ref: "common/money.json" },
+    },
+  },
+  "https://example.com/schemas/customer.json": {
+    definitions: { name: { type: "string" } },
+  },
+  "https://example.com/schemas/common/money.json": {
+    type: "number",
+    currency: { $ref: "../customer.json#/definitions/name" },
+  },
+};
+
+test("loads the documents a schema refers to", async () => {
+  const asked: string[] = [];
+
+  const { schema } = await dereferenceSchemaFrom(order, undefined, (url) => {
+    asked.push(url);
+    return files[url];
+  });
+
+  assert.deepEqual(schema, {
+    properties: {
+      customer: { type: "string" },
+      total: { type: "number", currency: { type: "string" } },
+    },
+  });
+  assert.deepEqual(asked.toSorted(), Object.keys(files).toSorted());
+});
+
+test("waits for a resolver that returns a promise", async () => {
+  const { schema } = await dereferenceSchemaFrom(
+    order,
+    { circular: "reject" },
+    (url) => Promise.resolve(files[url]),
+  );
+
+  assert.ok(isRecord(schema) && isRecord(schema.properties));
+  assert.deepEqual(schema.properties.customer, { type: "string" });
+});
+
+test("rejects when a document cannot be loaded", async () => {
+  await assert.rejects(
+    dereferenceSchemaFrom(order, undefined, (url) => {
+      if (url === order) {
+        return files[url];
+      }
+      throw new Error(`no ${url}`);
+    }),
+    /no https:\/\/example\.com\/schemas\//,
+  );
+});
+
+test("stops loading at the document limit", async () => {
+  let loads = 0;
+
+  await assert.rejects(
+    dereferenceSchemaFrom(
+      "https://example.com/chain/0.json",
+      { maxDocuments: 5 },
+      () => {
+        loads += 1;
+        return { next: { $ref: `${loads}.json` } };
+      },
+    ),
+    /references lead through more than 5 documents/,
+  );
+  assert.equal(loads, 5);
+});
+
+/** Runs `action` with `fetch` answering from `answer`, and counts the calls. */
+async function withFetch(
+  answer: (url: string) => Response,
+  action: () => Promise<void>,
+): Promise<number> {
+  const original = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = (input) => {
+    calls += 1;
+    return Promise.resolve(answer(String(input)));
+  };
+  try {
+    await action();
+  } finally {
+    globalThis.fetch = original;
+  }
+  return calls;
+}
+
+test("fetches documents when given no resolver", async () => {
+  const calls = await withFetch(
+    (url) => new Response(JSON.stringify(files[url])),
+    async () => {
+      const { schema } = await dereferenceSchemaFrom(order);
+
+      assert.ok(isRecord(schema) && isRecord(schema.properties));
+      assert.deepEqual(schema.properties.customer, { type: "string" });
+    },
+  );
+
+  assert.equal(calls, 3);
+});
+
+test("the default loader refuses local and private addresses", async () => {
+  const refused = [
+    "http://localhost/schema.json",
+    "http://localhost./schema.json",
+    "http://127.0.0.1/schema.json",
+    "http://2130706433/schema.json",
+    "http://10.1.2.3/schema.json",
+    "http://172.20.0.1/schema.json",
+    "http://192.168.1.1/schema.json",
+    "http://169.254.169.254/latest/meta-data",
+    "http://[::1]/schema.json",
+    "http://service.internal/schema.json",
+    "http://metadata/schema.json",
+    "file:///etc/passwd",
+    "data:application/json,%7B%7D",
+  ];
+
+  const calls = await withFetch(
+    () => new Response("{}"),
+    async () => {
+      for (const url of refused) {
+        await assert.rejects(
+          dereferenceSchemaFrom(url),
+          /the default loader does not fetch/,
+          url,
+        );
+      }
+    },
+  );
+
+  assert.equal(calls, 0);
+});
+
+test("the default loader checks where a redirect leads", async () => {
+  const calls = await withFetch(
+    () =>
+      new Response(null, {
+        status: 302,
+        headers: { location: "http://169.254.169.254/latest/meta-data" },
+      }),
+    async () => {
+      await assert.rejects(
+        dereferenceSchemaFrom(order),
+        /does not fetch http:\/\/169\.254\.169\.254\/latest\/meta-data, which names a local or private host/,
+      );
+    },
+  );
+
+  assert.equal(calls, 1);
+});
+
+test("the default loader stays on the origin it was given", async () => {
+  const calls = await withFetch(
+    () =>
+      new Response(
+        JSON.stringify({ other: { $ref: "https://elsewhere.example/x.json" } }),
+      ),
+    async () => {
+      await assert.rejects(
+        dereferenceSchemaFrom(order),
+        /does not fetch https:\/\/elsewhere\.example\/x\.json, which is on another origin/,
+      );
+    },
+  );
+
+  assert.equal(calls, 1);
+});
+
+test("the default loader stops reading a document that is too large", async () => {
+  await withFetch(
+    () => new Response(JSON.stringify({ padding: "x".repeat(10_000) })),
+    async () => {
+      await assert.rejects(
+        dereferenceSchemaFrom(order, { maxBytes: 1_000 }),
+        /is larger than the 1000 bytes left to load/,
+      );
+    },
+  );
+});
+
+test("counts the documents a resolver returns against the size limit", async () => {
+  await assert.rejects(
+    dereferenceSchemaFrom(
+      order,
+      { maxBytes: 1_000 },
+      () => ({ padding: "x".repeat(10_000) }),
+    ),
+    /output takes more than 1000 bytes/,
+  );
 });
 
 test("counts containers and references", () => {

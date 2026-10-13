@@ -213,6 +213,9 @@ proptest! {
             Err(
                 unexpected @ (Error::ExternalReference { .. }
                 | Error::UnresolvedReference { .. }
+                | Error::InvalidUrl { .. }
+                | Error::MissingDocument { .. }
+                | Error::DocumentLimitExceeded { .. }
                 | Error::DepthLimitExceeded { .. }
                 | Error::SizeLimitExceeded { .. }),
             ) => return Err(unexpected.into()),

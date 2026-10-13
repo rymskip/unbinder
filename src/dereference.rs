@@ -11,6 +11,7 @@ use core::ptr;
 use serde::{Serialize, Serializer};
 use serde_json::{Map, Value};
 
+use crate::documents::{Document, Documents};
 use crate::error::Error;
 use crate::references::{CycleId, References, Target};
 use crate::shared::{Merged, Shared};
@@ -78,6 +79,9 @@ pub struct Options {
     /// Writing a target out once per reference to it can make a small
     /// document describe a very large output.
     pub max_bytes: usize,
+    /// How many documents the references may lead through. A document can
+    /// name any number of others, each of which has to be loaded.
+    pub max_documents: usize,
 }
 
 impl Options {
@@ -86,6 +90,8 @@ impl Options {
     pub const DEFAULT_MAX_DEPTH: usize = 128;
     /// The default for [`Options::max_bytes`], 256 mebibytes.
     pub const DEFAULT_MAX_BYTES: usize = 268_435_456;
+    /// The default for [`Options::max_documents`].
+    pub const DEFAULT_MAX_DOCUMENTS: usize = 1024;
 }
 
 impl Default for Options {
@@ -95,6 +101,7 @@ impl Default for Options {
             siblings: SiblingMerge::default(),
             max_depth: Self::DEFAULT_MAX_DEPTH,
             max_bytes: Self::DEFAULT_MAX_BYTES,
+            max_documents: Self::DEFAULT_MAX_DOCUMENTS,
         }
     }
 }
@@ -261,7 +268,11 @@ pub fn dereference_schema_shared<'doc>(
     schema: &'doc Value,
     options: &Options,
 ) -> Result<SharedSchema<'doc>, Error> {
-    let (shared, bytes) = expand(schema, options)?;
+    let root = Document {
+        root: schema,
+        url: None,
+    };
+    let (shared, bytes) = expand(root, None, options)?;
     if bytes > options.max_bytes {
         return Err(Error::SizeLimitExceeded {
             limit: options.max_bytes,
@@ -270,29 +281,31 @@ pub fn dereference_schema_shared<'doc>(
     Ok(shared)
 }
 
-/// Expands `schema` into its shared form, and measures the memory it would
-/// take written out as a tree.
+/// Expands the document `root` into its shared form, following references
+/// into `documents` if there are any, and measures the memory it would take
+/// written out as a tree.
 pub(crate) fn expand<'doc>(
-    schema: &'doc Value,
+    root: Document<'doc>,
+    documents: Option<&'doc Documents>,
     options: &Options,
 ) -> Result<(SharedSchema<'doc>, usize), Error> {
     let mut expansion = Expansion {
-        references: References::analyze(schema, options.max_depth)?,
+        references: References::analyze(root, documents, options)?,
         options,
         bytes_left: options.max_bytes,
         inlined: BTreeMap::new(),
         circular: BTreeSet::new(),
     };
-    let root = expansion.value(schema, None, options.max_depth)?;
+    let expanded = expansion.value(root.root, root, None, options.max_depth)?;
     let schema = SharedSchema {
-        shared: root.shared,
+        shared: expanded.shared,
         circular: expansion
             .circular
             .into_iter()
             .map(ToOwned::to_owned)
             .collect(),
     };
-    Ok((schema, root.bytes))
+    Ok((schema, expanded.bytes))
 }
 
 /// A value with what it comes to once written out as a tree.
@@ -374,11 +387,12 @@ impl<'doc> Expansion<'doc, '_> {
         }
     }
 
-    /// Expands `node`. `enclosing` is the cycle of the innermost target being
-    /// inlined around it.
+    /// Expands `node`, which is in the document `within`. `enclosing` is the
+    /// cycle of the innermost target being inlined around it.
     fn value(
         &mut self,
         node: &'doc Value,
+        within: Document<'doc>,
         enclosing: Option<CycleId>,
         depth_left: usize,
     ) -> Result<Measured<'doc>, Error> {
@@ -390,7 +404,7 @@ impl<'doc> Expansion<'doc, '_> {
             // A target reached where it stands expands to what a reference
             // to it inlines, so the two share one expansion.
             Some(target) if target.cycle() == enclosing => self.inline(&target, depth_left),
-            Some(_) | None => self.expand(node, enclosing, depth_left),
+            Some(_) | None => self.expand(node, within, enclosing, depth_left),
         }
     }
 
@@ -409,7 +423,12 @@ impl<'doc> Expansion<'doc, '_> {
                 Err(self.too_deep())
             };
         }
-        let mut expanded = self.expand(target.value(), target.cycle(), depth_left)?;
+        let mut expanded = self.expand(
+            target.value(),
+            target.document(),
+            target.cycle(),
+            depth_left,
+        )?;
         expanded.shared = match expanded.shared {
             // A scalar is copied, and a reference to a reference shares the
             // expansion it already points at.
@@ -433,6 +452,7 @@ impl<'doc> Expansion<'doc, '_> {
     fn expand(
         &mut self,
         node: &'doc Value,
+        within: Document<'doc>,
         enclosing: Option<CycleId>,
         depth_left: usize,
     ) -> Result<Measured<'doc>, Error> {
@@ -441,14 +461,16 @@ impl<'doc> Expansion<'doc, '_> {
         };
         match node {
             Value::Object(members) => match reference_of(node) {
-                Some(reference) => self.reference(node, members, reference, enclosing, depth_left),
-                None => self.object(node, members, enclosing, depth_left),
+                Some(reference) => {
+                    self.reference(node, members, reference, within, enclosing, depth_left)
+                }
+                None => self.object(node, members, within, enclosing, depth_left),
             },
             Value::Array(items) => {
                 let mut totals = Totals::new();
                 let mut changed: Option<Vec<Shared<'doc>>> = None;
                 for (position, item) in items.iter().enumerate() {
-                    let child = self.value(item, enclosing, depth_left)?;
+                    let child = self.value(item, within, enclosing, depth_left)?;
                     totals.add(&child, 0);
                     if let Some(expanded) = &mut changed {
                         expanded.push(child.shared);
@@ -480,13 +502,14 @@ impl<'doc> Expansion<'doc, '_> {
         &mut self,
         node: &'doc Value,
         members: &'doc Map<String, Value>,
+        within: Document<'doc>,
         enclosing: Option<CycleId>,
         depth_left: usize,
     ) -> Result<Measured<'doc>, Error> {
         let mut totals = Totals::new();
         let mut changed: Option<Vec<(&'doc str, Shared<'doc>)>> = None;
         for (position, (name, member)) in members.iter().enumerate() {
-            let child = self.value(member, enclosing, depth_left)?;
+            let child = self.value(member, within, enclosing, depth_left)?;
             totals.add(&child, NAME_BYTES.saturating_add(name.len()));
             if let Some(expanded) = &mut changed {
                 expanded.push((name, child.shared));
@@ -518,10 +541,11 @@ impl<'doc> Expansion<'doc, '_> {
         node: &'doc Value,
         members: &'doc Map<String, Value>,
         reference: &'doc str,
+        within: Document<'doc>,
         enclosing: Option<CycleId>,
         depth_left: usize,
     ) -> Result<Measured<'doc>, Error> {
-        let target = self.references.target(reference)?;
+        let target = self.references.target(within, reference)?;
         let stays = match self.options.circular {
             CircularPolicy::Ignore => target.leads_to_cycle(),
             // Two targets share a cycle only when each leads to the other, so
@@ -534,7 +558,7 @@ impl<'doc> Expansion<'doc, '_> {
             return match self.options.circular {
                 CircularPolicy::Expand | CircularPolicy::Ignore => {
                     self.circular.insert(reference);
-                    self.object(node, members, enclosing, depth_left)
+                    self.object(node, members, within, enclosing, depth_left)
                 }
                 CircularPolicy::Reject => Err(Error::CircularReference {
                     reference: reference.to_owned(),
@@ -553,7 +577,7 @@ impl<'doc> Expansion<'doc, '_> {
             if name == REFERENCE_KEY {
                 continue;
             }
-            let sibling = self.value(member, enclosing, depth_left)?;
+            let sibling = self.value(member, within, enclosing, depth_left)?;
             inlined.height = inlined.height.max(sibling.height.saturating_add(1));
             inlined.bytes = inlined
                 .bytes

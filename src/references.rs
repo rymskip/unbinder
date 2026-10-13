@@ -1,10 +1,11 @@
-//! The graph formed by a document's references, and the cycles in it.
+//! The graph formed by the references of a document and of the documents it
+//! refers to, and the cycles in it.
 //!
 //! The nodes are the values that references point at. An edge runs from a
 //! target to every target referenced inside it, and to every target nested
 //! directly inside it, since inlining the outer one copies the inner one's
-//! references too. The graph is built in one pass over the document, so the
-//! analysis stays proportional to the document however its targets nest.
+//! references too. The graph is built in one pass over each document, so the
+//! analysis stays proportional to the documents however their targets nest.
 
 use alloc::borrow::ToOwned;
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -19,6 +20,8 @@ use core::ptr;
 
 use serde_json::Value;
 
+use crate::dereference::Options;
+use crate::documents::{Document, Documents, split};
 use crate::error::{Error, PointerError};
 use crate::pointer;
 use crate::walk::{Values, reference_of};
@@ -41,6 +44,7 @@ enum Visit {
 #[derive(Debug)]
 pub(crate) struct Target<'doc> {
     value: &'doc Value,
+    document: Document<'doc>,
     cycle: Cell<Option<CycleId>>,
     leads_to_cycle: Cell<bool>,
     visit: Cell<Visit>,
@@ -49,6 +53,12 @@ pub(crate) struct Target<'doc> {
 impl<'doc> Target<'doc> {
     pub(crate) fn value(&self) -> &'doc Value {
         self.value
+    }
+
+    /// The document the value is in, which its own references are relative
+    /// to.
+    pub(crate) fn document(&self) -> Document<'doc> {
+        self.document
     }
 
     /// The cycle this target takes part in, if any.
@@ -63,10 +73,20 @@ impl<'doc> Target<'doc> {
     }
 }
 
+/// A reference as it is told apart from others: by the document it is
+/// written in and by its text.
+type Written<'doc> = (*const Value, &'doc str);
+
+fn written<'doc>(within: Document<'doc>, reference: &'doc str) -> Written<'doc> {
+    (ptr::from_ref(within.root), reference)
+}
+
 /// A pointer partway through being followed.
 struct Walk<'doc> {
-    reference: &'doc str,
+    key: Written<'doc>,
     current: &'doc Value,
+    /// The document `current` is in.
+    within: Document<'doc>,
     tokens: Peekable<IntoIter<String>>,
     /// The references passed through since the last token was applied.
     passed: BTreeSet<*const Value>,
@@ -75,7 +95,7 @@ struct Walk<'doc> {
 impl Walk<'_> {
     fn unresolved(&self, cause: PointerError) -> Error {
         Error::UnresolvedReference {
-            reference: self.reference.to_owned(),
+            reference: self.key.1.to_owned(),
             cause,
         }
     }
@@ -89,7 +109,7 @@ fn passes_through<'doc>(current: &'doc Value, token: &str) -> Option<&'doc str> 
     (!current.as_object()?.contains_key(token)).then_some(reference)
 }
 
-/// The targets each target leads to, keyed by where the target sits in the
+/// The targets each target leads to, keyed by where the target sits in its
 /// document.
 type Successors<'doc> = BTreeMap<*const Value, Vec<Rc<Target<'doc>>>>;
 
@@ -111,11 +131,12 @@ struct Frame<'doc> {
     leads_to_cycle: bool,
 }
 
-/// Every reference in a document, resolved and grouped into cycles.
+/// Every reference a document leads to, resolved and grouped into cycles.
 #[derive(Debug)]
 pub(crate) struct References<'doc> {
-    root: &'doc Value,
-    by_reference: BTreeMap<&'doc str, Rc<Target<'doc>>>,
+    /// The other documents references may point into, if any were given.
+    documents: Option<&'doc Documents>,
+    by_reference: BTreeMap<Written<'doc>, Rc<Target<'doc>>>,
     /// Two spellings of one pointer share a target, so targets are told
     /// apart by the address of the value they point at.
     by_address: BTreeMap<*const Value, Rc<Target<'doc>>>,
@@ -125,19 +146,41 @@ pub(crate) struct References<'doc> {
 }
 
 impl<'doc> References<'doc> {
-    /// Resolves every reference in `root` and finds the cycles among them.
-    pub(crate) fn analyze(root: &'doc Value, max_hops: usize) -> Result<Self, Error> {
+    /// Resolves every reference `root` leads to, in it and in the documents
+    /// it refers to, and finds the cycles among them.
+    pub(crate) fn analyze(
+        root: Document<'doc>,
+        documents: Option<&'doc Documents>,
+        options: &Options,
+    ) -> Result<Self, Error> {
         let mut references = Self {
-            root,
+            documents,
             by_reference: BTreeMap::new(),
             by_address: BTreeMap::new(),
             cycles: 0,
-            max_hops,
+            max_hops: options.max_depth,
         };
-        for reference in Values::of(root).filter_map(reference_of) {
-            references.target(reference)?;
+        let mut reached = Vec::new();
+        let mut found = BTreeSet::from([ptr::from_ref(root.root)]);
+        let mut pending = vec![root];
+        while let Some(document) = pending.pop() {
+            reached.push(document);
+            for reference in Values::of(document.root).filter_map(reference_of) {
+                let target = references.target(document, reference)?;
+                if found.insert(ptr::from_ref(target.document.root)) {
+                    if found.len() > options.max_documents {
+                        return Err(Error::DocumentLimitExceeded {
+                            limit: options.max_documents,
+                        });
+                    }
+                    pending.push(target.document);
+                }
+            }
         }
-        let mut successors = references.successors();
+        let mut successors = Successors::new();
+        for document in reached {
+            references.successors(document.root, &mut successors);
+        }
         let starts: Vec<_> = references.by_address.values().map(Rc::clone).collect();
         for start in starts {
             references.search(start, &mut successors);
@@ -150,28 +193,34 @@ impl<'doc> References<'doc> {
         self.by_address.get(&ptr::from_ref(value)).map(Rc::clone)
     }
 
-    /// The target of `reference`, resolved on first use.
+    /// The target of `reference` as written in the document `within`,
+    /// resolved on first use.
     ///
     /// A pointer that reaches a reference with tokens still to apply passes
     /// through it and carries on from that reference's target. Pointers
     /// waiting on one another are kept on an explicit stack, so a long chain
     /// of them cannot exhaust the call stack.
-    pub(crate) fn target(&mut self, reference: &'doc str) -> Result<Rc<Target<'doc>>, Error> {
-        if let Some(known) = self.by_reference.get(reference) {
+    pub(crate) fn target(
+        &mut self,
+        within: Document<'doc>,
+        reference: &'doc str,
+    ) -> Result<Rc<Target<'doc>>, Error> {
+        if let Some(known) = self.by_reference.get(&written(within, reference)) {
             return Ok(Rc::clone(known));
         }
         let mut active = BTreeSet::new();
         let mut waiting = Vec::new();
-        let mut walk = self.start(reference, &mut active)?;
+        let mut walk = self.start(within, reference, &mut active)?;
         loop {
             let Some(token) = walk.tokens.peek() else {
                 let target = self.register(&walk);
-                active.remove(walk.reference);
+                active.remove(&walk.key);
                 let Some(resumed) = waiting.pop() else {
                     return Ok(target);
                 };
                 walk = resumed;
                 walk.current = target.value;
+                walk.within = target.document;
                 continue;
             };
             let Some(through) = passes_through(walk.current, token) else {
@@ -186,13 +235,15 @@ impl<'doc> References<'doc> {
                     limit: self.max_hops,
                 });
             }
-            if !walk.passed.insert(ptr::from_ref(walk.current)) || active.contains(through) {
+            let through = written(walk.within, through);
+            if !walk.passed.insert(ptr::from_ref(walk.current)) || active.contains(&through) {
                 return Err(walk.unresolved(PointerError::ReferenceLoop));
             }
-            if let Some(known) = self.by_reference.get(through) {
+            if let Some(known) = self.by_reference.get(&through) {
                 walk.current = known.value;
+                walk.within = known.document;
             } else {
-                let next = self.start(through, &mut active)?;
+                let next = self.start(walk.within, through.1, &mut active)?;
                 waiting.push(mem::replace(&mut walk, next));
             }
         }
@@ -200,22 +251,30 @@ impl<'doc> References<'doc> {
 
     fn start(
         &self,
+        within: Document<'doc>,
         reference: &'doc str,
-        active: &mut BTreeSet<&'doc str>,
+        active: &mut BTreeSet<Written<'doc>>,
     ) -> Result<Walk<'doc>, Error> {
-        let Some(fragment) = reference.strip_prefix('#') else {
-            return Err(Error::ExternalReference {
-                reference: reference.to_owned(),
-            });
+        let (location, fragment) = split(reference);
+        let document = match (location, self.documents) {
+            ("", _) => within,
+            (_, Some(documents)) => documents.find(within.url, location)?,
+            (_, None) => {
+                return Err(Error::ExternalReference {
+                    reference: reference.to_owned(),
+                });
+            }
         };
         let tokens = pointer::tokens(fragment).map_err(|cause| Error::UnresolvedReference {
             reference: reference.to_owned(),
             cause,
         })?;
-        active.insert(reference);
+        let key = written(within, reference);
+        active.insert(key);
         Ok(Walk {
-            reference,
-            current: self.root,
+            key,
+            current: document.root,
+            within: document,
             tokens: tokens.into_iter().peekable(),
             passed: BTreeSet::new(),
         })
@@ -229,22 +288,22 @@ impl<'doc> References<'doc> {
                 .or_insert_with(|| {
                     Rc::new(Target {
                         value: walk.current,
+                        document: walk.within,
                         cycle: Cell::new(None),
                         leads_to_cycle: Cell::new(false),
                         visit: Cell::new(Visit::Unvisited),
                     })
                 }),
         );
-        self.by_reference.insert(walk.reference, Rc::clone(&target));
+        self.by_reference.insert(walk.key, Rc::clone(&target));
         target
     }
 
-    /// Walks the document once, giving each reference and each nested target
+    /// Walks a document once, giving each reference and each nested target
     /// to the innermost target that encloses it.
-    fn successors(&self) -> Successors<'doc> {
-        let mut successors = Successors::new();
+    fn successors(&self, root: &'doc Value, successors: &mut Successors<'doc>) {
         let mut open = Vec::new();
-        let mut steps = vec![Step::Enter(self.root)];
+        let mut steps = vec![Step::Enter(root)];
         while let Some(step) = steps.pop() {
             let value = match step {
                 Step::Enter(value) => value,
@@ -264,8 +323,8 @@ impl<'doc> References<'doc> {
                 open.push(address);
                 steps.push(Step::Leave);
             }
-            let referenced =
-                reference_of(value).and_then(|reference| self.by_reference.get(reference));
+            let referenced = reference_of(value)
+                .and_then(|reference| self.by_reference.get(&(ptr::from_ref(root), reference)));
             if let (Some(enclosing), Some(referenced)) = (open.last(), referenced) {
                 successors
                     .entry(*enclosing)
@@ -278,7 +337,6 @@ impl<'doc> References<'doc> {
                 Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
             }
         }
-        successors
     }
 
     /// Tarjan's strongly connected components algorithm, with an explicit

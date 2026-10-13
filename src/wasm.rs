@@ -12,20 +12,25 @@
 //! The TypeScript declarations are generated from the Rust types, and the
 //! documentation here is what a JavaScript caller reads.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::rc::Rc;
 use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
 
-use js_sys::JSON;
+use js_sys::{Function, JSON, Promise};
 use serde::Serialize;
 use serde_json::Value;
 use tsify::Ts;
 use wasm_bindgen::prelude::{JsError, JsValue, wasm_bindgen};
+use wasm_bindgen_futures::JsFuture;
 
 use crate::dereference::expand;
+use crate::documents::Document;
 use crate::shared::Shared;
-use crate::{Dereferenced, Error, Options, SharedSchema, Stats, dereference_schema_shared};
+use crate::{
+    Dereferenced, Documents, Error, Options, SharedSchema, Stats, dereference_schema_shared,
+};
 
 #[wasm_bindgen(inline_js = r#"
 // Builds the result from a table of entries. An entry is a value with holes
@@ -66,10 +71,121 @@ export function link(text) {
   }
   return { schema: nodes[nodes.length - 1][0], circular };
 }
+
+const privateSuffixes = [
+  ".localhost",
+  ".local",
+  ".internal",
+  ".intranet",
+  ".corp",
+  ".home",
+  ".lan",
+];
+
+// Why the default loader will not fetch `url`, or nothing if it will.
+//
+// A document names the URLs it refers to, so what a document can make the
+// loader fetch has to be bounded. It fetches over HTTP(S) only, never from a
+// host named as this machine or a private network, and never from another
+// origin than the document it was asked for. The last rule is what holds
+// when a public name leads to a private address: the loader contacts no
+// host the caller did not name.
+function refusal(url, root) {
+  const { protocol, hostname, origin } = new URL(url);
+  if (protocol !== "http:" && protocol !== "https:") {
+    return "is not an http or https URL";
+  }
+  const host = hostname.replace(/\.$/, "");
+  if (
+    !host.includes(".") ||
+    host.startsWith("[") ||
+    privateSuffixes.some((suffix) => host.endsWith(suffix))
+  ) {
+    return "names a local or private host";
+  }
+  const address = host.split(".").map(Number);
+  if (address.length === 4 && !address.some(Number.isNaN)) {
+    const [first, second] = address;
+    if (
+      first === 0 ||
+      first === 10 ||
+      first === 127 ||
+      first >= 224 ||
+      (first === 100 && second >= 64 && second <= 127) ||
+      (first === 169 && second === 254) ||
+      (first === 172 && second >= 16 && second <= 31) ||
+      (first === 192 && second === 168)
+    ) {
+      return "names a local or private host";
+    }
+  }
+  if (origin !== new URL(root).origin) {
+    return `is on another origin than ${root}`;
+  }
+  return undefined;
+}
+
+// Reads a response as text, giving up once it passes `limit` bytes.
+async function read(response, limit, url) {
+  if (response.body === null) {
+    return "";
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  let bytes = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) {
+      return text + decoder.decode();
+    }
+    bytes += value.byteLength;
+    if (bytes > limit) {
+      await reader.cancel();
+      throw new Error(`${url} is larger than the ${limit} bytes left to load`);
+    }
+    text += decoder.decode(value, { stream: true });
+  }
+}
+
+// Loads a document the way a caller who gives no other way gets: fetched as
+// JSON text of at most `limit` bytes. `root` is the URL the caller asked
+// for. A redirect is followed only where its target can be seen and passes
+// the same checks.
+export async function load(url, limit, root) {
+  let target = url;
+  for (let hops = 0; hops <= 5; hops += 1) {
+    const refused = refusal(target, root);
+    if (refused !== undefined) {
+      throw new Error(
+        `the default loader does not fetch ${target}, which ${refused}; pass a resolver to load it`,
+      );
+    }
+    const response = await fetch(target, { redirect: "manual" });
+    const location = response.headers.get("location");
+    if (response.status >= 300 && response.status < 400 && location) {
+      target = new URL(location, target).href;
+      continue;
+    }
+    if (response.type === "opaqueredirect") {
+      throw new Error(
+        `${target} redirects somewhere the default loader cannot check; pass a resolver to load it`,
+      );
+    }
+    if (!response.ok) {
+      throw new Error(`${target} answered ${response.status}`);
+    }
+    return read(response, limit, target);
+  }
+  throw new Error(`${url} redirects too many times`);
+}
 "#)]
 extern "C" {
     #[wasm_bindgen(catch)]
     fn link(table: &str) -> Result<JsValue, JsValue>;
+
+    #[wasm_bindgen(catch)]
+    fn load(url: &str, limit: usize, root: &str) -> Result<JsValue, JsValue>;
 }
 
 /// Replaces every `$ref` in `schema` with the value it points at.
@@ -88,10 +204,96 @@ pub fn dereference_schema(
 ) -> Result<Ts<Dereferenced>, JsValue> {
     let options = read_options(options)?;
     let schema = serde_json::from_str(&json_of(schema)?).map_err(thrown)?;
+    let root = Document {
+        root: &schema,
+        url: None,
+    };
+    linked(root, None, &options)
+}
+
+/// Loads the document at `url` and every document its references lead to,
+/// then replaces every `$ref` in it with the value it points at, as
+/// `dereferenceSchema` does.
+///
+/// `resolve` is called with the absolute URL of each document and returns
+/// the document or a promise of it. References in a document are relative to
+/// its own URL.
+///
+/// Without `resolve`, each document is fetched as JSON, under rules that
+/// bound what a document can make it fetch: only `http:` and `https:` URLs,
+/// never one that names this machine or a private network, and only from the
+/// origin of `url`. Redirects are held to the same rules. Pass a `resolve`
+/// to load anything else.
+///
+/// # Errors
+///
+/// Rejects when a document cannot be loaded or read, when the documents
+/// together are larger than `maxBytes` or more than `maxDocuments`, and for
+/// every reason `dereferenceSchema` throws.
+#[wasm_bindgen(js_name = dereferenceSchemaFrom)]
+pub async fn dereference_schema_from(
+    url: String,
+    #[wasm_bindgen(unchecked_optional_param_type = "Options")] options: Option<Ts<Options>>,
+    #[wasm_bindgen(unchecked_optional_param_type = "(url: string) => unknown")] resolve: Option<
+        Function,
+    >,
+) -> Result<Ts<Dereferenced>, JsValue> {
+    let options = read_options(options)?;
+    let mut documents = Documents::new();
+    let mut loaded: usize = 0;
+    // What the documents may still take between them.
+    let mut bytes_left = options.max_bytes;
+    let root = Documents::normalized(&url).map_err(thrown)?;
+    let mut asked = BTreeSet::from([root.clone()]);
+    let mut wanted = vec![root.clone()];
+    while let Some(next) = wanted.pop() {
+        if loaded >= options.max_documents {
+            return Err(thrown(Error::DocumentLimitExceeded {
+                limit: options.max_documents,
+            }));
+        }
+        // One load per turn, so the count cannot saturate.
+        loaded = loaded.saturating_add(1);
+        let text = match &resolve {
+            Some(resolve) => {
+                let answer = resolve.call1(&JsValue::NULL, &JsValue::from_str(&next))?;
+                json_of(&JsFuture::from(Promise::resolve(&answer)).await?)?
+            }
+            // The default loader stops reading at what is left, so a
+            // document too large is never held in full.
+            None => JsFuture::from(Promise::resolve(&load(&next, bytes_left, &root)?))
+                .await?
+                .as_string()
+                .ok_or_else(|| JsError::new("the loader did not return text"))?,
+        };
+        bytes_left = bytes_left.checked_sub(text.len()).ok_or_else(|| {
+            thrown(Error::SizeLimitExceeded {
+                limit: options.max_bytes,
+            })
+        })?;
+        let document = serde_json::from_str(&text).map_err(thrown)?;
+        // Only what this document refers to is new, so only that is looked
+        // at, however many documents came before.
+        for referred in documents.add(&next, document).map_err(thrown)? {
+            if asked.insert(referred.clone()) {
+                wanted.push(referred.clone());
+            }
+        }
+    }
+    let root = documents.find(None, &root).map_err(thrown)?;
+    linked(root, Some(&documents), &options)
+}
+
+/// Dereferences `root` and hands the result to JavaScript as shared objects.
+fn linked(
+    root: Document<'_>,
+    documents: Option<&Documents>,
+    options: &Options,
+) -> Result<Ts<Dereferenced>, JsValue> {
     // The limit is on what the result takes, and shared objects take no more
     // room for being referred to often. The table counts what it writes.
-    let (shared, _) = expand(&schema, &options).map_err(thrown)?;
-    let table = Table::write(&shared, &options)?;
+    let (shared, _) = expand(root, documents, options).map_err(thrown)?;
+    let table = Table::write(&shared, options)?;
     Ok(Ts::new_unchecked(link(&table)?))
 }
 

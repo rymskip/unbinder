@@ -4,6 +4,7 @@
 extern crate alloc;
 
 mod dereference;
+mod documents;
 mod error;
 mod pointer;
 mod references;
@@ -17,5 +18,6 @@ pub use crate::dereference::{
     CircularPolicy, Dereferenced, Options, SharedSchema, SiblingMerge, dereference_schema,
     dereference_schema_shared, dereference_schema_with,
 };
+pub use crate::documents::Documents;
 pub use crate::error::{Error, PointerError};
 pub use crate::stats::Stats;

@@ -54,6 +54,8 @@ pub(crate) struct Back<'doc> {
     pub(crate) link: Rc<OnceCell<Weak<Anchor<'doc>>>>,
     /// The reference as written, for an output that cannot hold a cycle.
     pub(crate) written: &'doc Value,
+    /// The value the link points at, as the document has it.
+    pub(crate) target: &'doc Value,
 }
 
 #[cfg(feature = "wasm")]
@@ -105,6 +107,20 @@ impl<'doc> Shared<'doc> {
             #[cfg(feature = "wasm")]
             Self::Back(_) => false,
             Self::Inlined(anchor) => anchor.value.is_object(),
+        }
+    }
+
+    /// Whether this may turn out to be an object where it meets one under
+    /// the same name: an object is one, and a link may stand for one.
+    pub(crate) fn may_be_object(&self) -> bool {
+        match self {
+            #[cfg(feature = "wasm")]
+            Self::Back(_) => true,
+            Self::Original(_)
+            | Self::Array(_)
+            | Self::Object(_)
+            | Self::Inlined(_)
+            | Self::Merged(_) => self.is_object(),
         }
     }
 

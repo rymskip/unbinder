@@ -267,14 +267,36 @@ fn replaces_the_objects_of_the_target_on_request() {
     );
 }
 
+/// The keywords next to a reference apply along with its target, so they
+/// are all that is left next to a target that accepts everything, and
+/// nothing passes a target that accepts nothing.
 #[test]
-fn drops_the_siblings_of_a_target_that_is_not_an_object() {
+fn keeps_the_keywords_next_to_a_reference_to_a_boolean_schema() {
     let schema = json!({
-        "definitions": { "anything": true },
-        "flag": { "$ref": "#/definitions/anything", "description": "Anything" }
+        "definitions": { "anything": true, "nothing": false },
+        "limited": { "$ref": "#/definitions/anything", "maxLength": 5 },
+        "never": { "$ref": "#/definitions/nothing", "maxLength": 5 }
     });
 
-    assert_eq!(member(&schema, "flag"), Ok(Some(json!(true))));
+    assert_eq!(
+        member(&schema, "limited"),
+        Ok(Some(json!({ "maxLength": 5 })))
+    );
+    assert_eq!(member(&schema, "never"), Ok(Some(json!(false))));
+}
+
+#[test]
+fn keeps_the_keywords_next_to_a_reference_to_a_reference() {
+    let schema = json!({
+        "real": { "type": "string" },
+        "alias": { "$ref": "#/real" },
+        "limited": { "$ref": "#/alias", "maxLength": 5 }
+    });
+
+    assert_eq!(
+        member(&schema, "limited"),
+        Ok(Some(json!({ "type": "string", "maxLength": 5 })))
+    );
 }
 
 #[test]

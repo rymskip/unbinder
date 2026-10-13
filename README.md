@@ -448,7 +448,8 @@ Run it with `pixi run bench`.
 -   A pointer that passes through a `$ref` with sibling keywords finds the
     siblings first and the target's members second. It does not see the two
     merged, so it cannot reach into an object that deep merging would combine.
--   A sibling of a `$ref` whose target is not an object is dropped.
+-   Keywords next to a `$ref` are kept as they are when its target is the
+    schema `true`, and dropped when it is `false` or is not a schema.
 -   Every object with a string `$ref` member is treated as a reference,
     including one inside `enum`, `const`, `default` or `examples`.
 -   `$anchor` and `$dynamicRef` are not interpreted.

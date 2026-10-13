@@ -282,13 +282,13 @@ pub fn dereference_schema_shared<'doc>(
         root: schema,
         url: None,
     };
-    let (shared, bytes) = expand(&root, None, options, Form::Written)?;
-    if bytes > options.max_bytes {
+    let expanded = expand(&root, None, options, Form::Written)?;
+    if expanded.bytes > options.max_bytes {
         return Err(Error::SizeLimitExceeded {
             limit: options.max_bytes,
         });
     }
-    Ok(shared)
+    Ok(expanded.schema)
 }
 
 /// Expands the document `root` into its shared form, following references
@@ -299,7 +299,7 @@ pub(crate) fn expand<'doc>(
     documents: Option<&'doc Documents>,
     options: &Options,
     form: Form,
-) -> Result<(SharedSchema<'doc>, usize), Error> {
+) -> Result<Expanded<'doc>, Error> {
     let linking = match form {
         #[cfg(feature = "wasm")]
         Form::Linked => options.circular == CircularPolicy::Link,
@@ -312,19 +312,55 @@ pub(crate) fn expand<'doc>(
         bytes_left: options.max_bytes,
         inlined: BTreeMap::new(),
         #[cfg(feature = "wasm")]
-        expanding: BTreeMap::new(),
+        expanding: BTreeSet::new(),
+        #[cfg(feature = "wasm")]
+        links: BTreeMap::new(),
+        #[cfg(feature = "wasm")]
+        queued: Vec::new(),
         circular: BTreeSet::new(),
     };
     let expanded = expansion.value(root.root, root, None, options.max_depth)?;
-    let schema = SharedSchema {
-        shared: expanded.shared,
-        circular: expansion
-            .circular
-            .into_iter()
-            .map(ToOwned::to_owned)
+    // A link stands in for a target until the target is expanded here, on its
+    // own, however long the chain of references that led to it.
+    #[cfg(feature = "wasm")]
+    while let Some(target) = expansion.queued.pop() {
+        expansion.inline(&target, options.max_depth)?;
+    }
+    Ok(Expanded {
+        schema: SharedSchema {
+            shared: expanded.shared,
+            circular: expansion
+                .circular
+                .into_iter()
+                .map(ToOwned::to_owned)
+                .collect(),
+        },
+        bytes: expanded.bytes,
+        #[cfg(feature = "wasm")]
+        anchors: expansion
+            .inlined
+            .into_values()
+            .filter_map(|measured| match measured.shared {
+                Shared::Inlined(anchor) => Some(anchor),
+                Shared::Original(_)
+                | Shared::Array(_)
+                | Shared::Object(_)
+                | Shared::Merged(_)
+                | Shared::Back(_) => None,
+            })
             .collect(),
-    };
-    Ok((schema, expanded.bytes))
+    })
+}
+
+/// A document in its shared form.
+pub(crate) struct Expanded<'doc> {
+    pub(crate) schema: SharedSchema<'doc>,
+    /// The memory the document would take written out as a tree.
+    pub(crate) bytes: usize,
+    /// The expansions that the links in `schema` point at. A link does not
+    /// keep its target alive, so these do, for as long as they are held.
+    #[cfg(feature = "wasm")]
+    pub(crate) anchors: Vec<Rc<Anchor<'doc>>>,
 }
 
 /// What the expansion is for.
@@ -398,10 +434,16 @@ struct Expansion<'doc, 'options> {
     /// The expansion of each target inlined so far, by where the target sits
     /// in the document.
     inlined: BTreeMap<*const Value, Measured<'doc>>,
-    /// The targets being expanded right now, each with the place its
-    /// finished expansion goes for the links back to it.
+    /// The targets being expanded right now.
     #[cfg(feature = "wasm")]
-    expanding: BTreeMap<*const Value, Rc<OnceCell<Weak<Anchor<'doc>>>>>,
+    expanding: BTreeSet<*const Value>,
+    /// For each target a link points at, the place its expansion goes once
+    /// it is made.
+    #[cfg(feature = "wasm")]
+    links: BTreeMap<*const Value, Rc<OnceCell<Weak<Anchor<'doc>>>>>,
+    /// The targets a link points at that are still to be expanded.
+    #[cfg(feature = "wasm")]
+    queued: Vec<Rc<Target<'doc>>>,
     circular: BTreeSet<&'doc str>,
 }
 
@@ -464,9 +506,7 @@ impl<'doc> Expansion<'doc, '_> {
             };
         }
         #[cfg(feature = "wasm")]
-        let link = Rc::new(OnceCell::new());
-        #[cfg(feature = "wasm")]
-        self.expanding.insert(address, Rc::clone(&link));
+        self.expanding.insert(address);
         let expanded = self.expand(
             target.value(),
             target.document(),
@@ -492,7 +532,10 @@ impl<'doc> Expansion<'doc, '_> {
         };
         #[cfg(feature = "wasm")]
         if let Shared::Inlined(anchor) = &expanded.shared {
-            link.get_or_init(|| Rc::downgrade(anchor));
+            self.links
+                .entry(address)
+                .or_default()
+                .get_or_init(|| Rc::downgrade(anchor));
         }
         self.inlined.insert(address, expanded.clone());
         Ok(expanded)
@@ -604,24 +647,27 @@ impl<'doc> Expansion<'doc, '_> {
     ) -> Result<Measured<'doc>, Error> {
         let target = self.references.target(within, reference)?;
         #[cfg(feature = "wasm")]
-        if let Some(link) = self.expanding.get(&ptr::from_ref(target.value()))
-            && self.linking
-        {
-            self.circular.insert(reference);
-            // Keywords next to the reference would have to merge into a
-            // target that is not finished, so such a reference stays.
-            if members.len() > 1 {
+        let target = if self.linking {
+            if target.cycle().is_some() && target.cycle() == enclosing {
+                self.circular.insert(reference);
+            }
+            let Some(target) = self.settle(target)? else {
+                // The references lead only to one another, so this one stays.
+                return self.object(node, members, within, enclosing, depth_left);
+            };
+            if members.len() == 1 {
+                return Ok(self.link(node, &target));
+            }
+            // Keywords next to the reference merge into its target, which has
+            // to be expanded first. One that is being expanded right now
+            // cannot be merged into, so such a reference stays.
+            if self.expanding.contains(&ptr::from_ref(target.value())) {
                 return self.object(node, members, within, enclosing, depth_left);
             }
-            return Ok(Measured {
-                shared: Shared::Back(Back {
-                    link: Rc::clone(link),
-                    written: node,
-                }),
-                height: 1,
-                bytes: VALUE_BYTES,
-            });
-        }
+            target
+        } else {
+            target
+        };
         let stays = !self.linking
             && match self.options.circular {
                 CircularPolicy::Ignore => target.leads_to_cycle(),
@@ -645,8 +691,15 @@ impl<'doc> Expansion<'doc, '_> {
         }
         let mut inlined = self.inline(&target, depth_left)?;
         inlined.height = inlined.height.saturating_add(1);
-        // Siblings have nothing to merge into unless the target is an object.
-        if members.len() == 1 || !inlined.shared.is_object() {
+        if members.len() == 1 {
+            return Ok(inlined);
+        }
+        // The keywords next to a reference apply along with its target. They
+        // merge into a target that is an object and are all there is next to
+        // one that accepts everything. Nothing passes a target that accepts
+        // nothing, and any other value is not a schema they could apply to.
+        let accepts_everything = matches!(inlined.shared, Shared::Original(Value::Bool(true)));
+        if !accepts_everything && !inlined.shared.is_object() {
             return Ok(inlined);
         }
         self.charge(members.len(), size_of::<(&str, Shared<'_>)>())?;
@@ -664,8 +717,80 @@ impl<'doc> Expansion<'doc, '_> {
                 .saturating_add(sibling.bytes);
             siblings.push((name.as_str(), sibling.shared));
         }
-        inlined.shared = self.merge(inlined.shared, siblings)?;
+        inlined.shared = if accepts_everything {
+            Shared::Object(siblings.into())
+        } else {
+            self.merge(inlined.shared, siblings, depth_left)?
+        };
         Ok(inlined)
+    }
+
+    /// The target a reference to `target` reaches in the end. A reference to
+    /// a bare reference is a reference to what that one points at. There is
+    /// no such target when the references lead only to one another.
+    #[cfg(feature = "wasm")]
+    fn settle(&mut self, mut target: Rc<Target<'doc>>) -> Result<Option<Rc<Target<'doc>>>, Error> {
+        let mut passed = BTreeSet::new();
+        while let Some(next) = reference_of(target.value())
+            && target
+                .value()
+                .as_object()
+                .is_some_and(|bare| bare.len() == 1)
+        {
+            if !passed.insert(ptr::from_ref(target.value())) {
+                return Ok(None);
+            }
+            if passed.len() > self.options.max_depth {
+                return Err(self.too_deep());
+            }
+            let document = target.document().clone();
+            target = self.references.target(&document, next)?;
+        }
+        Ok(Some(target))
+    }
+
+    /// Makes the reference `node` a link to `target`. The target is expanded
+    /// later and on its own, so a chain of references is never followed
+    /// deeper than one of its links.
+    #[cfg(feature = "wasm")]
+    fn link(&mut self, node: &'doc Value, target: &Rc<Target<'doc>>) -> Measured<'doc> {
+        let address = ptr::from_ref(target.value());
+        match target.value() {
+            Value::Object(_) | Value::Array(_) => {
+                if !self.links.contains_key(&address) && !self.inlined.contains_key(&address) {
+                    self.queued.push(Rc::clone(target));
+                }
+                Measured {
+                    shared: Shared::Back(Back {
+                        link: Rc::clone(self.links.entry(address).or_default()),
+                        written: node,
+                        target: target.value(),
+                    }),
+                    height: 1,
+                    bytes: VALUE_BYTES,
+                }
+            }
+            Value::String(text) => Measured::scalar(target.value(), text.len()),
+            Value::Null | Value::Bool(_) | Value::Number(_) => Measured::scalar(target.value(), 0),
+        }
+    }
+
+    /// What a link is merged as: the expansion of its target. A target that
+    /// is being expanded right now has none to give yet, so its link is
+    /// merged as the reference it was written as, which still asks for
+    /// everything the target does.
+    #[cfg(feature = "wasm")]
+    fn behind(&mut self, shared: Shared<'doc>, depth_left: usize) -> Result<Shared<'doc>, Error> {
+        let Shared::Back(back) = &shared else {
+            return Ok(shared);
+        };
+        if self.expanding.contains(&ptr::from_ref(back.target)) {
+            return Ok(Shared::Original(back.written));
+        }
+        match self.references.at(back.target) {
+            Some(target) => Ok(self.inline(&target, depth_left)?.shared),
+            None => Ok(Shared::Original(back.written)),
+        }
     }
 
     /// Lays `siblings` over `base`. Under [`SiblingMerge::Deep`] two objects
@@ -675,11 +800,12 @@ impl<'doc> Expansion<'doc, '_> {
         &mut self,
         base: Shared<'doc>,
         siblings: Vec<(&'doc str, Shared<'doc>)>,
+        depth_left: usize,
     ) -> Result<Shared<'doc>, Error> {
         let mut overrides = Vec::with_capacity(siblings.len());
         for (name, sibling) in siblings {
             let held = match self.options.siblings {
-                SiblingMerge::Deep if sibling.is_object() => {
+                SiblingMerge::Deep if sibling.may_be_object() => {
                     // Looking a name up can mean reading every member of the
                     // base, at every reference that merges into it.
                     self.charge(base.scan(), size_of::<&str>())?;
@@ -687,18 +813,39 @@ impl<'doc> Expansion<'doc, '_> {
                 }
                 SiblingMerge::Deep | SiblingMerge::Shallow => None,
             };
-            match held {
-                Some(held) if held.is_object() => {
-                    self.charge(sibling.width(), size_of::<(&str, Shared<'_>)>())?;
-                    let mut inner = Vec::with_capacity(sibling.width());
-                    let Ok(()) = sibling.members::<Infallible>(&mut |name, member| {
-                        inner.push((name, member.clone()));
-                        Ok(())
-                    });
-                    overrides.push((name, self.merge(held, inner)?));
+            // Where two values meet under one name, a link gives way to what
+            // it stands for, or two objects would not be seen to be objects
+            // and one would replace the other.
+            #[cfg(feature = "wasm")]
+            let held = match held {
+                Some(held) => Some(self.behind(held, depth_left)?),
+                None => None,
+            };
+            let Some(held) = held.filter(Shared::is_object) else {
+                overrides.push((name, sibling));
+                continue;
+            };
+            #[cfg(feature = "wasm")]
+            let sibling = {
+                let opened = self.behind(sibling.clone(), depth_left)?;
+                if !opened.is_object() {
+                    overrides.push((name, sibling));
+                    continue;
                 }
-                Some(_) | None => overrides.push((name, sibling)),
-            }
+                opened
+            };
+            // Each object merged into is a level, as each one expanded is.
+            // Two links that lead back to themselves would merge forever.
+            let Some(deeper) = depth_left.checked_sub(1) else {
+                return Err(self.too_deep());
+            };
+            self.charge(sibling.width(), size_of::<(&str, Shared<'_>)>())?;
+            let mut inner = Vec::with_capacity(sibling.width());
+            let Ok(()) = sibling.members::<Infallible>(&mut |name, member| {
+                inner.push((name, member.clone()));
+                Ok(())
+            });
+            overrides.push((name, self.merge(held, inner, deeper)?));
         }
         Ok(Shared::Merged(Rc::new(Merged::new(base, overrides))))
     }

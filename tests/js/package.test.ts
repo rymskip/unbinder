@@ -82,6 +82,161 @@ test("links a cycle that runs through several definitions", () => {
   assert.equal(schema.c.title, "C");
 });
 
+test("links a cycle far longer than the depth limit", () => {
+  const length = 20_000;
+  const ring: Record<string, unknown> = {};
+  for (let index = 0; index < length; index += 1) {
+    ring[`d${index}`] = { next: [{ $ref: `#/d${(index + 1) % length}` }] };
+  }
+
+  const { schema } = dereferenceSchema(ring);
+
+  assert.ok(isRecord(schema));
+  let node = schema.d0;
+  for (let index = 1; index <= length; index += 1) {
+    assert.ok(isRecord(node) && Array.isArray(node.next));
+    node = node.next[0];
+    assert.equal(node, schema[`d${index % length}`]);
+  }
+});
+
+test("links a long chain of references that each add a keyword", () => {
+  const length = 100;
+  const chain: Record<string, unknown> = { d0: { type: "string" } };
+  for (let index = 1; index < length; index += 1) {
+    chain[`d${index}`] = { $ref: `#/d${index - 1}`, [`k${index}`]: index };
+  }
+
+  const { schema } = dereferenceSchema(chain);
+
+  assert.ok(isRecord(schema) && isRecord(schema.d99));
+  assert.equal(Object.keys(schema.d99).length, length);
+  assert.equal(schema.d99.type, "string");
+  assert.equal(schema.d99.k1, 1);
+});
+
+test("a chain of bare references past the depth limit is an error", () => {
+  const chain: Record<string, unknown> = { d0: { type: "string" } };
+  for (let index = 1; index <= 200; index += 1) {
+    chain[`d${index}`] = { $ref: `#/d${index - 1}` };
+  }
+  chain.last = { $ref: "#/d200" };
+
+  for (const circular of ["link", "expand"] as const) {
+    throwsError(
+      () => dereferenceSchema(chain, { circular }),
+      "depth limit of 128 levels exceeded",
+    );
+  }
+});
+
+test("merging the members of two cycles keeps the links of both", () => {
+  const input = {
+    a: { properties: { b: { $ref: "#/b" }, own: { type: "string" } } },
+    b: { properties: { a: { $ref: "#/a" }, own: { type: "number" } } },
+    merged: { $ref: "#/a", properties: { $ref: "#/b/properties" } },
+  };
+
+  const { schema } = dereferenceSchema(input);
+  const expanded = dereferenceSchema(input, { circular: "expand" }).schema;
+
+  assert.ok(isRecord(schema) && isRecord(schema.merged));
+  assert.ok(isRecord(expanded) && isRecord(expanded.merged));
+  const properties = schema.merged.properties;
+  assert.ok(isRecord(properties));
+  assert.deepEqual(Object.keys(properties).toSorted(), ["a", "b", "own"]);
+  assert.deepEqual(properties.own, { type: "number" });
+  assert.equal(properties.b, schema.b);
+  assert.equal(properties.a, schema.a);
+  assert.ok(isRecord(expanded.merged.properties));
+  assert.deepEqual(
+    Object.keys(expanded.merged.properties).toSorted(),
+    ["a", "b", "own"],
+  );
+});
+
+test("a keyword merges into a link to a recursive target", () => {
+  const { schema } = dereferenceSchema({
+    node: { properties: { child: { $ref: "#/node" } } },
+    labelled: {
+      $ref: "#/node",
+      properties: { child: { description: "the first child" } },
+    },
+  });
+
+  assert.ok(isRecord(schema) && isRecord(schema.labelled));
+  assert.ok(isRecord(schema.node) && isRecord(schema.labelled.properties));
+  const child = schema.labelled.properties.child;
+  assert.ok(isRecord(child) && isRecord(child.properties));
+  assert.equal(child.description, "the first child");
+  assert.equal(child.properties.child, schema.node);
+  assert.equal("description" in schema.node, false);
+});
+
+test("a keyword does not replace a link that cannot be merged into yet", () => {
+  const { schema } = dereferenceSchema({
+    outer: {
+      inner: { $ref: "#/other", properties: { back: { title: "Back" } } },
+    },
+    other: { properties: { back: { $ref: "#/outer" } } },
+  });
+
+  assert.ok(isRecord(schema) && isRecord(schema.outer));
+  assert.ok(isRecord(schema.outer.inner));
+  assert.ok(isRecord(schema.outer.inner.properties));
+  assert.deepEqual(schema.outer.inner.properties.back, {
+    title: "Back",
+    $ref: "#/outer",
+  });
+});
+
+test("two cycles that would merge forever hit the depth limit", () => {
+  throwsError(
+    () =>
+      dereferenceSchema({
+        a: { properties: { next: { $ref: "#/a" } } },
+        b: { properties: { next: { $ref: "#/b" } } },
+        both: { $ref: "#/a", properties: { $ref: "#/b/properties" } },
+      }),
+    "depth limit of 128 levels exceeded",
+  );
+});
+
+// Linking must not change what a schema allows, whatever it links through.
+test("linking keeps every keyword that expanding keeps", () => {
+  const input = {
+    real: { type: "string", properties: { $ref: "#/props" } },
+    props: { id: { type: "integer" } },
+    alias: { $ref: "#/real" },
+    limited: { $ref: "#/alias", maxLength: 5 },
+    named: { $ref: "#/real", properties: { name: { type: "string" } } },
+    extended: { $ref: "#/real", properties: { $ref: "#/more" } },
+    more: { extra: { type: "boolean" } },
+    anything: true,
+    bounded: { $ref: "#/anything", maxLength: 5 },
+  };
+
+  const linked = dereferenceSchema(input).schema;
+  const expanded = dereferenceSchema(input, { circular: "expand" }).schema;
+
+  assert.deepEqual(linked, expanded);
+  assert.ok(isRecord(linked));
+  assert.deepEqual(linked.limited, {
+    maxLength: 5,
+    type: "string",
+    properties: { id: { type: "integer" } },
+  });
+  assert.deepEqual(linked.named, {
+    type: "string",
+    properties: { id: { type: "integer" }, name: { type: "string" } },
+  });
+  assert.deepEqual(linked.extended, {
+    type: "string",
+    properties: { id: { type: "integer" }, extra: { type: "boolean" } },
+  });
+  assert.deepEqual(linked.bounded, { maxLength: 5 });
+});
+
 test("keeps the members of an object in the order they were written", () => {
   const { schema } = dereferenceSchema({
     zebra: { $ref: "#/base", title: "Zebra", apple: 1 },

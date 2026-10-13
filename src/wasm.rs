@@ -39,7 +39,7 @@ use crate::{
 // inheriting link gives the object at the path every member of the other
 // entry's value that it does not have.
 export function link(text) {
-  const { nodes, order, root, circular } = JSON.parse(text);
+  const { nodes, root, circular } = JSON.parse(text);
   // Defining a property keeps a member named __proto__ a plain member.
   const define = (holder, name, value) =>
     Object.defineProperty(holder, name, {
@@ -67,17 +67,38 @@ export function link(text) {
       }
     }
   }
-  // An entry was finished after the entries it takes members from.
-  for (const index of order) {
-    const node = nodes[index];
-    for (const [path, entry, inherit] of node[1]) {
-      if (inherit) {
-        const [holder, slot] = place(node, path);
-        const heir = holder[slot];
-        const source = nodes[entry][0];
-        for (const name of Object.keys(source)) {
-          if (!Object.hasOwn(heir, name)) {
-            define(heir, name, source[name]);
+  // An entry inherits after the entries it inherits from have. The entries
+  // still waiting are kept in a list, so a long chain of them is not a deep
+  // call. 0 is untouched, 1 is waiting on others, 2 is done.
+  const state = new Uint8Array(nodes.length);
+  for (let first = 0; first < nodes.length; first += 1) {
+    const waiting = [first];
+    while (waiting.length > 0) {
+      const index = waiting[waiting.length - 1];
+      const links = nodes[index][1];
+      if (state[index] === 0) {
+        state[index] = 1;
+        for (const [, entry, inherit] of links) {
+          if (inherit && state[entry] === 0) {
+            waiting.push(entry);
+          }
+        }
+        continue;
+      }
+      waiting.pop();
+      if (state[index] === 2) {
+        continue;
+      }
+      state[index] = 2;
+      for (const [path, entry, inherit] of links) {
+        if (inherit) {
+          const [holder, slot] = place(nodes[index], path);
+          const heir = holder[slot];
+          const source = nodes[entry][0];
+          for (const name of Object.keys(source)) {
+            if (!Object.hasOwn(heir, name)) {
+              define(heir, name, source[name]);
+            }
           }
         }
       }
@@ -312,8 +333,11 @@ fn linked(
 ) -> Result<Ts<Dereferenced>, JsValue> {
     // The limit is on what the result takes, and shared objects take no more
     // room for being referred to often. The table counts what it writes.
-    let (shared, _) = expand(root, documents, options, Form::Linked).map_err(thrown)?;
-    let table = Table::write(&shared, options)?;
+    let expanded = expand(root, documents, options, Form::Linked).map_err(thrown)?;
+    let table = Table::write(&expanded.schema, options)?;
+    // The links in the schema have been followed, so what they point at can
+    // go.
+    drop(expanded.anchors);
     Ok(Ts::new_unchecked(link(&table)?))
 }
 
@@ -464,11 +488,11 @@ struct Table<'doc, 'options> {
     bytes_left: usize,
     /// The entries written so far, by position.
     entries: BTreeMap<usize, Vec<u8>>,
-    /// The positions in the order their entries were finished.
-    order: Vec<usize>,
     /// How many positions have been given out.
     count: usize,
     targets: BTreeMap<*const Anchor<'doc>, Target>,
+    /// The targets given a position whose entries are still to be written.
+    pending: Vec<(usize, Rc<Anchor<'doc>>)>,
 }
 
 impl<'doc, 'options> Table<'doc, 'options> {
@@ -477,12 +501,17 @@ impl<'doc, 'options> Table<'doc, 'options> {
             options,
             bytes_left: options.max_bytes,
             entries: BTreeMap::new(),
-            order: Vec::new(),
             count: 0,
             targets: BTreeMap::new(),
+            pending: Vec::new(),
         };
         let root = table.reserve();
         table.entry(root, schema.shared())?;
+        // An entry is written on its own and not inside the one that links
+        // to it, so a long chain of links is not a deep call.
+        while let Some((position, target)) = table.pending.pop() {
+            table.entry(position, &target.value)?;
+        }
         let mut text = Vec::from(*b"{\"nodes\":[");
         for (position, entry) in &table.entries {
             if *position > 0 {
@@ -490,9 +519,7 @@ impl<'doc, 'options> Table<'doc, 'options> {
             }
             text.extend(entry);
         }
-        text.extend(b"],\"order\":");
-        serde_json::to_writer(&mut text, &table.order)?;
-        text.extend(b",\"root\":");
+        text.extend(b"],\"root\":");
         serde_json::to_writer(&mut text, &root)?;
         text.extend(b",\"circular\":");
         serde_json::to_writer(&mut text, schema.circular())?;
@@ -536,24 +563,22 @@ impl<'doc, 'options> Table<'doc, 'options> {
         serde_json::to_writer(&mut written, &links)?;
         written.push(b']');
         self.entries.insert(position, written);
-        self.order.push(position);
         Ok(())
     }
 
-    /// The entry of an inlined target, written on first use. Its position is
-    /// given out before it is written, so a link back to it from inside it
-    /// has somewhere to point.
-    fn inlined(&mut self, target: &Rc<Anchor<'doc>>) -> Result<Target, Failure> {
+    /// The entry of an inlined target. It is given a position on first use
+    /// and written later.
+    fn inlined(&mut self, target: &Rc<Anchor<'doc>>) -> Target {
         if let Some(known) = self.targets.get(&Rc::as_ptr(target)) {
-            return Ok(*known);
+            return *known;
         }
         let reserved = Target {
             position: self.reserve(),
             members: target.value.width(),
         };
         self.targets.insert(Rc::as_ptr(target), reserved);
-        self.entry(reserved.position, &target.value)?;
-        Ok(reserved)
+        self.pending.push((reserved.position, Rc::clone(target)));
+        reserved
     }
 }
 
@@ -577,7 +602,7 @@ impl<'doc> Entry<'_, 'doc, '_> {
 
     /// Records that the place being written takes `target`.
     fn link(&mut self, target: &Rc<Anchor<'doc>>, inherit: bool) -> Result<(), Failure> {
-        let target = self.table.inlined(target)?;
+        let target = self.table.inlined(target);
         let given = if inherit { target.members } else { 1 };
         self.table.charge(
             self.path

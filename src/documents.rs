@@ -311,13 +311,13 @@ impl Documents {
         let Some(root) = self.get(&url) else {
             return Err(Error::MissingDocument { url });
         };
-        let (shared, bytes) = expand(&root, Some(self), options, Form::Written)?;
-        if bytes > options.max_bytes {
+        let expanded = expand(&root, Some(self), options, Form::Written)?;
+        if expanded.bytes > options.max_bytes {
             return Err(Error::SizeLimitExceeded {
                 limit: options.max_bytes,
             });
         }
-        Ok(shared)
+        Ok(expanded.schema)
     }
 
     /// The document known by the absolute URL `url`.

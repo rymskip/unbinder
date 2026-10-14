@@ -5,7 +5,6 @@ import { execFileSync } from "node:child_process";
 import { readdir, readFile } from "node:fs/promises";
 import { cpus } from "node:os";
 import { basename, join } from "node:path";
-import { isDeepStrictEqual } from "node:util";
 
 import $RefParser from "@apidevtools/json-schema-ref-parser";
 import { Bench } from "tinybench";
@@ -138,6 +137,48 @@ function measureNative() {
   return output.trim().split("\n").map((line) => JSON.parse(line));
 }
 
+/**
+ * Whether two results hold the same values. Either may hold one object in
+ * many places and may hold cycles, so a pair of objects is compared once,
+ * however many places hold it. The work is then in proportion to the objects
+ * and not to the tree they would write out as.
+ */
+function identical(theirs, ours) {
+  const compared = new Map();
+  const pending = [[theirs, ours]];
+  while (pending.length > 0) {
+    const [left, right] = pending.pop();
+    if (
+      typeof left !== "object" || left === null ||
+      typeof right !== "object" || right === null
+    ) {
+      if (!Object.is(left, right)) {
+        return false;
+      }
+      continue;
+    }
+    const partners = compared.get(left) ?? new Set();
+    if (partners.has(right)) {
+      continue;
+    }
+    compared.set(left, partners.add(right));
+    const names = Object.keys(left);
+    if (
+      Array.isArray(left) !== Array.isArray(right) ||
+      names.length !== Object.keys(right).length
+    ) {
+      return false;
+    }
+    for (const name of names) {
+      if (!Object.hasOwn(right, name)) {
+        return false;
+      }
+      pending.push([left[name], right[name]]);
+    }
+  }
+  return true;
+}
+
 function milliseconds(value) {
   return value >= 100 ? value.toFixed(0) : value.toPrecision(3);
 }
@@ -218,7 +259,7 @@ for (const name of names) {
       mode.refParser,
     );
     const ours = dereferenceSchema(parsed, mode.unbinder).schema;
-    console.log(`outputs identical: ${isDeepStrictEqual(theirs, ours)}`);
+    console.log(`outputs identical: ${identical(theirs, ours)}`);
     const rows = [
       ...await measureJavaScript(text, parsed, mode),
       ...native

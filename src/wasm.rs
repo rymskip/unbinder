@@ -19,9 +19,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use js_sys::{Function, JSON, Promise};
-use serde::Serialize;
-use serde_json::Value;
-use tsify::Ts;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use tsify::{Ts, Tsify};
 use wasm_bindgen::prelude::{JsError, JsValue, wasm_bindgen};
 use wasm_bindgen_futures::JsFuture;
 
@@ -38,7 +38,11 @@ use crate::{
 // value of another entry at the path, which is how a cycle closes. An
 // inheriting link gives the object at the path every member of the other
 // entry's value that it does not have.
-export function link(text) {
+//
+// `into` is the object the caller wants rewritten in place of getting a new
+// one. It takes the members of the result before any link is made, so every
+// link to the result leads to it.
+export function link(text, into) {
   const { nodes, root, circular } = JSON.parse(text);
   // Defining a property keeps a member named __proto__ a plain member.
   const define = (holder, name, value) =>
@@ -57,6 +61,35 @@ export function link(text) {
     }
     return [holder, slot];
   };
+  // The result may be another entry whole, and that entry is then the one
+  // to rewrite.
+  let whole = root;
+  for (let hops = 0; hops < nodes.length; hops += 1) {
+    const through = nodes[whole][1].find(
+      ([path, , inherit]) => path.length === 0 && !inherit,
+    );
+    if (through === undefined) {
+      break;
+    }
+    whole = through[1];
+  }
+  const result = nodes[whole][0];
+  if (
+    typeof into === "object" && into !== null &&
+    typeof result === "object" && result !== null &&
+    Array.isArray(into) === Array.isArray(result)
+  ) {
+    if (Array.isArray(into)) {
+      into.length = 0;
+    }
+    for (const name of Object.keys(into)) {
+      delete into[name];
+    }
+    for (const name of Object.keys(result)) {
+      define(into, name, result[name]);
+    }
+    nodes[whole][0] = into;
+  }
   // Every hole is filled before anything is inherited, so that what is
   // inherited is complete.
   for (const node of nodes) {
@@ -117,44 +150,84 @@ const privateSuffixes = [
   ".lan",
 ];
 
+// The networks no public host is in: this machine, private and link-local
+// networks, the ranges set aside for documents and tests, and the ranges
+// that carry an IPv4 address inside an IPv6 one. An IPv4 address written as
+// an IPv6 one is held to the IPv4 list, so that range is not closed whole.
+const closedIPv4 = [
+  ["0.0.0.0", 8],
+  ["10.0.0.0", 8],
+  ["100.64.0.0", 10],
+  ["127.0.0.0", 8],
+  ["169.254.0.0", 16],
+  ["172.16.0.0", 12],
+  ["192.0.0.0", 24],
+  ["192.0.2.0", 24],
+  ["192.88.99.0", 24],
+  ["192.168.0.0", 16],
+  ["198.18.0.0", 15],
+  ["198.51.100.0", 24],
+  ["203.0.113.0", 24],
+  ["224.0.0.0", 3],
+];
+const closedIPv6 = [
+  ["::", 96],
+  ["64:ff9b::", 96],
+  ["64:ff9b:1::", 48],
+  ["100::", 64],
+  ["2001::", 23],
+  ["2001:db8::", 32],
+  ["2002::", 16],
+  ["fc00::", 7],
+  ["fe80::", 10],
+  ["fec0::", 10],
+  ["ff00::", 8],
+];
+
+// Whether the four parts of an IPv4 address put it in a closed network.
+function closed(parts) {
+  const number = (bytes) => bytes.reduce((sum, byte) => sum * 256 + byte, 0);
+  return closedIPv4.some(([network, prefix]) => {
+    const size = 2 ** (32 - prefix);
+    return (
+      Math.floor(number(parts) / size) ===
+        Math.floor(number(network.split(".").map(Number)) / size)
+    );
+  });
+}
+
+const refused = (verb, url, reason) =>
+  new Error(`the default loader does not ${verb} ${url}, which ${reason}; pass a resolver to load it`);
+
 // Why the default loader will not fetch `url`, or nothing if it will.
 //
 // A document names the URLs it refers to, so what a document can make the
-// loader fetch has to be bounded. It fetches over HTTP(S) only, never from a
-// host named as this machine or a private network, and never from another
-// origin than the document it was asked for. The last rule is what holds
-// when a public name leads to a private address: the loader contacts no
-// host the caller did not name.
-function refusal(url, root) {
+// loader fetch has to be bounded. It fetches over HTTP(S) only. Unless the
+// caller turned the rule off, it never fetches from a host named as this
+// machine or a private network, and never from another origin than the
+// document it was asked for. The last rule is what holds when a public name
+// leads to a private address: the loader contacts no host the caller did not
+// name.
+function refusal(url, root, policy) {
   const { protocol, hostname, origin } = new URL(url);
   if (protocol !== "http:" && protocol !== "https:") {
     return "is not an http or https URL";
   }
   const host = hostname.replace(/\.$/, "");
-  if (
-    !host.includes(".") ||
-    host.startsWith("[") ||
-    privateSuffixes.some((suffix) => host.endsWith(suffix))
-  ) {
-    return "names a local or private host";
-  }
-  const address = host.split(".").map(Number);
-  if (address.length === 4 && !address.some(Number.isNaN)) {
-    const [first, second] = address;
+  if (policy.safeUrlResolver) {
     if (
-      first === 0 ||
-      first === 10 ||
-      first === 127 ||
-      first >= 224 ||
-      (first === 100 && second >= 64 && second <= 127) ||
-      (first === 169 && second === 254) ||
-      (first === 172 && second >= 16 && second <= 31) ||
-      (first === 192 && second === 168)
+      !host.includes(".") ||
+      host.startsWith("[") ||
+      privateSuffixes.some((suffix) => host.endsWith(suffix))
     ) {
       return "names a local or private host";
     }
+    const address = host.split(".").map(Number);
+    if (address.length === 4 && !address.some(Number.isNaN) && closed(address)) {
+      return "names a local or private host";
+    }
   }
-  if (origin !== new URL(root).origin) {
+  if (policy.sameOrigin && origin !== new URL(root).origin) {
     return `is on another origin than ${root}`;
   }
   return undefined;
@@ -179,96 +252,71 @@ async function gather(next, limit, url) {
   }
 }
 
-// Reads a response as text of at most `limit` bytes.
-async function read(response, limit, url) {
-  if (response.body === null) {
-    return "";
-  }
-  const reader = response.body.getReader();
-  try {
-    return await gather(
-      async () => {
-        const { done, value } = await reader.read();
-        return done ? undefined : value;
-      },
-      limit,
-      url,
-    );
-  } finally {
-    await reader.cancel();
-  }
-}
-
 // One of the modules a runtime with a file system comes with. A browser has
 // none, and a bundler has nothing to resolve, since nothing is imported.
 function builtin(name) {
   const found = globalThis.process?.getBuiltinModule?.(name);
   if (found === undefined) {
-    throw new Error("this runtime has no file system; pass a resolver to load files");
+    throw new Error(`this runtime has no ${name}; pass a resolver to load documents`);
   }
   return found;
 }
 
-// The file: URL of the file at `location`, which is a path or such a URL
-// already.
-export function fileUrl(location) {
-  return /^file:/i.test(location)
-    ? location
-    : builtin("node:url").pathToFileURL(location).href;
-}
-
-// The folder documents may be read from when the caller asked for the file
-// at the URL `root`: the one the caller names, by path or file: URL, and
-// otherwise the one that holds the file.
-export function fileFolder(root, folder) {
-  const { fileURLToPath } = builtin("node:url");
-  const { dirname, resolve } = builtin("node:path");
-  if (folder === undefined) {
-    return dirname(fileURLToPath(root));
+// The URL of the document asked for by `location`. Where files may be read,
+// anything that is not a URL is the path of one.
+export function locate(location, policy) {
+  // A drive letter reads as a scheme of one letter.
+  if (policy.files === "none" || /^[a-z][a-z0-9+.-]+:/i.test(location)) {
+    return location;
   }
-  return /^file:/i.test(folder) ? fileURLToPath(folder) : resolve(folder);
+  return builtin("node:url").pathToFileURL(location).href;
 }
 
 const documentTypes = [".json", ".yaml", ".yml"];
 
 // Reads the file at `url` as text of at most `limit` bytes. `root` is the
-// URL of the file the caller asked for.
+// URL of the document the caller asked for.
 //
-// A document names the files it refers to, so what a document can make this
-// read has to be bounded. It reads files on this machine only, and only in
-// `folder` or below it. The folder is checked before the disk is touched, so
-// no other machine is contacted, and again once links are followed, so a
-// link cannot lead out of it. A file a document refers to has to be named as
-// JSON or YAML, since any text reads as YAML and would be inlined.
-export async function loadFile(url, limit, root, folder) {
+// It reads files on this machine only. Under the "folder" rule a document
+// can make it read only in one folder or below it: the one the caller named,
+// or the one that holds the file asked for. The folder is checked before the
+// disk is touched and again once links are followed, so a link cannot lead
+// out of it, and a file a document refers to has to be named as JSON or
+// YAML, since any text reads as YAML and would be inlined. The "any" rule
+// reads whatever file a document names.
+async function loadFile(url, limit, root, policy) {
   const { fileURLToPath } = builtin("node:url");
-  const { extname, isAbsolute, relative, sep } = builtin("node:path");
+  const { dirname, extname, isAbsolute, relative, resolve, sep } = builtin("node:path");
   const { open, realpath } = builtin("node:fs/promises");
-  const refuse = (reason) =>
-    new Error(`the file loader does not read ${url}, which ${reason}; pass a resolver to load it`);
-  const { protocol, hostname } = new URL(url);
-  if (protocol !== "file:") {
-    throw refuse("is not a file");
+  if (new URL(url).hostname !== "") {
+    throw refused("read", url, "names another machine");
   }
-  if (hostname !== "") {
-    throw refuse("names another machine");
+  let path = fileURLToPath(url);
+  if (policy.files === "folder") {
+    if (policy.folder === undefined && new URL(root).protocol !== "file:") {
+      throw new Error("load.folder has to name the folder files are read from");
+    }
+    const folder = policy.folder === undefined
+      ? dirname(fileURLToPath(root))
+      : /^file:/i.test(policy.folder)
+      ? fileURLToPath(policy.folder)
+      : resolve(policy.folder);
+    const inside = (inner, holder) => {
+      const from = relative(holder, inner);
+      return from !== "" && from !== ".." && !from.startsWith(`..${sep}`) && !isAbsolute(from);
+    };
+    if (!inside(path, folder)) {
+      throw refused("read", url, `is outside ${folder}`);
+    }
+    path = await realpath(path);
+    if (!inside(path, await realpath(folder))) {
+      throw refused("read", url, `is a link that leads outside ${folder}`);
+    }
+    if (url !== root && !documentTypes.includes(extname(path).toLowerCase())) {
+      throw refused("read", url, `is not a ${documentTypes.join(", ")} file`);
+    }
   }
-  const inside = (path, holder) => {
-    const from = relative(holder, path);
-    return from !== "" && from !== ".." && !from.startsWith(`..${sep}`) && !isAbsolute(from);
-  };
-  const path = fileURLToPath(url);
-  if (!inside(path, folder)) {
-    throw refuse(`is outside ${folder}`);
-  }
-  const real = await realpath(path);
-  if (!inside(real, await realpath(folder))) {
-    throw refuse(`is a link that leads outside ${folder}`);
-  }
-  if (url !== root && !documentTypes.includes(extname(real).toLowerCase())) {
-    throw refuse(`is not a ${documentTypes.join(", ")} file`);
-  }
-  const handle = await open(real, "r");
+  const handle = await open(path, "r");
   try {
     // Read in pieces, since what a path names need not have an end.
     const buffer = new Uint8Array(65536);
@@ -285,68 +333,254 @@ export async function loadFile(url, limit, root, folder) {
   }
 }
 
-// Loads a document the way a caller who gives no other way gets: fetched as
-// text of at most `limit` bytes. `root` is the URL the caller asked for. A
-// redirect is followed only where its target can be seen and passes the same
-// checks.
-export async function load(url, limit, root) {
+// The addresses the host of `url` leads to, each one checked. A name anyone
+// can register may lead to an address only this network can reach.
+//
+// A page makes its own connection, under the browser's rules, so there is
+// nothing to check there. Anywhere else, a host that cannot be looked up
+// cannot be held to an address, and is refused. A runtime that says it is a
+// server is never taken for a page, whatever globals a page would have.
+async function checked(url) {
+  const dns = globalThis.process?.getBuiltinModule?.("node:dns/promises");
+  if (dns === undefined) {
+    const server = globalThis.process?.versions?.node !== undefined ||
+      globalThis.Deno !== undefined ||
+      globalThis.Bun !== undefined;
+    if (!server && globalThis.window !== undefined && globalThis.document !== undefined) {
+      return undefined;
+    }
+    throw refused("fetch", url, "leads somewhere this runtime cannot check");
+  }
+  const { BlockList } = builtin("node:net");
+  const networks = new BlockList();
+  for (const [network, prefix] of closedIPv4) {
+    networks.addSubnet(network, prefix, "ipv4");
+  }
+  for (const [network, prefix] of closedIPv6) {
+    networks.addSubnet(network, prefix, "ipv6");
+  }
+  const { hostname } = new URL(url);
+  const found = await dns.lookup(hostname.replace(/^\[|\]$/g, "").replace(/\.$/, ""), {
+    all: true,
+    verbatim: true,
+  });
+  if (
+    found.length === 0 ||
+    found.some(({ address, family }) => networks.check(address, family === 6 ? "ipv6" : "ipv4"))
+  ) {
+    throw refused("fetch", url, "leads to a local or private address");
+  }
+  return found;
+}
+
+// Sends one request for `url`, which gets a minute. With `pinned`, the
+// addresses its host was checked to lead to, the connection is made to one
+// of those, so that a second lookup cannot lead anywhere else.
+async function get(url, pinned, limit) {
+  const signal = AbortSignal.timeout(60_000);
+  if (pinned === undefined) {
+    const response = await fetch(url, { redirect: "manual", signal });
+    return {
+      status: response.status,
+      location: response.headers.get("location"),
+      opaque: response.type === "opaqueredirect",
+      text: async () => {
+        if (response.body === null) {
+          return "";
+        }
+        const reader = response.body.getReader();
+        return gather(
+          async () => {
+            const { done, value } = await reader.read();
+            return done ? undefined : value;
+          },
+          limit,
+          url,
+        );
+      },
+      discard: async () => {
+        if (response.body !== null && !response.body.locked) {
+          await response.body.cancel();
+        }
+      },
+    };
+  }
+  const { request } = builtin(new URL(url).protocol === "https:" ? "node:https" : "node:http");
+  const bare = (hostname) => hostname.replace(/^\[|\]$/g, "").replace(/\.$/, "").toLowerCase();
+  const lookup = (hostname, options, callback) => {
+    const family = options.family === "IPv4" ? 4 : options.family === "IPv6" ? 6 : options.family || 0;
+    const fitting = bare(hostname) === bare(new URL(url).hostname)
+      ? pinned.filter((address) => family === 0 || address.family === family)
+      : [];
+    if (fitting.length === 0) {
+      callback(Object.assign(new Error(`no checked address for ${hostname}`), { code: "ENOTFOUND" }));
+    } else if (options.all) {
+      callback(null, fitting);
+    } else {
+      callback(null, fitting[0].address, fitting[0].family);
+    }
+  };
+  const response = await new Promise((resolve, reject) => {
+    const sent = request(
+      url,
+      {
+        method: "GET",
+        headers: { accept: "*/*", "accept-encoding": "identity" },
+        lookup,
+        agent: false,
+        signal,
+      },
+      resolve,
+    );
+    sent.on("error", reject);
+    sent.end();
+  });
+  return {
+    status: response.statusCode,
+    location: response.headers.location ?? null,
+    opaque: false,
+    text: async () => {
+      const encoding = response.headers["content-encoding"] ?? "identity";
+      if (encoding !== "identity") {
+        throw new Error(`${url} answered in the encoding ${encoding}, which was not asked for`);
+      }
+      const pieces = response[Symbol.asyncIterator]();
+      return gather(
+        async () => {
+          const { done, value } = await pieces.next();
+          return done ? undefined : value;
+        },
+        limit,
+        url,
+      );
+    },
+    discard: async () => {
+      response.destroy();
+    },
+  };
+}
+
+// Loads a document the way a caller who gives no other way gets: as text of
+// at most `limit` bytes, under the rules in `policy`. `root` is the URL of
+// the document the caller asked for. A redirect is followed only where its
+// target can be seen and passes the same checks.
+export async function load(url, limit, root, policy) {
+  if (policy.files !== "none" && new URL(url).protocol === "file:") {
+    return loadFile(url, limit, root, policy);
+  }
   let target = url;
   for (let hops = 0; hops <= 5; hops += 1) {
-    const refused = refusal(target, root);
-    if (refused !== undefined) {
-      throw new Error(
-        `the default loader does not fetch ${target}, which ${refused}; pass a resolver to load it`,
-      );
+    const reason = refusal(target, root, policy);
+    if (reason !== undefined) {
+      throw refused("fetch", target, reason);
     }
-    const response = await fetch(target, { redirect: "manual" });
-    const location = response.headers.get("location");
-    if (response.status >= 300 && response.status < 400 && location) {
-      target = new URL(location, target).href;
-      continue;
+    // A host the caller did not name is looked up and held to its answer.
+    const pinned = policy.safeUrlResolver && !policy.sameOrigin
+      ? await checked(target)
+      : undefined;
+    const response = await get(target, pinned, limit);
+    try {
+      if (response.status >= 300 && response.status < 400 && response.location) {
+        target = new URL(response.location, target).href;
+        continue;
+      }
+      if (response.opaque) {
+        throw new Error(
+          `${target} redirects somewhere the default loader cannot check; pass a resolver to load it`,
+        );
+      }
+      if (response.status < 200 || response.status >= 300) {
+        throw new Error(`${target} answered ${response.status}`);
+      }
+      return await response.text();
+    } finally {
+      await response.discard();
     }
-    if (response.type === "opaqueredirect") {
-      throw new Error(
-        `${target} redirects somewhere the default loader cannot check; pass a resolver to load it`,
-      );
-    }
-    if (!response.ok) {
-      throw new Error(`${target} answered ${response.status}`);
-    }
-    return read(response, limit, target);
   }
   throw new Error(`${url} redirects too many times`);
 }
 "#)]
 extern "C" {
     #[wasm_bindgen(catch)]
-    fn link(table: &str) -> Result<JsValue, JsValue>;
+    fn link(table: &str, into: &JsValue) -> Result<JsValue, JsValue>;
 
     #[wasm_bindgen(catch)]
-    fn load(url: &str, limit: usize, root: &str) -> Result<JsValue, JsValue>;
+    fn load(url: &str, limit: usize, root: &str, policy: &JsValue) -> Result<JsValue, JsValue>;
 
-    #[wasm_bindgen(catch, js_name = loadFile)]
-    fn load_file(url: &str, limit: usize, root: &str, folder: &str) -> Result<JsValue, JsValue>;
+    #[wasm_bindgen(catch)]
+    fn locate(location: &str, policy: &JsValue) -> Result<String, JsValue>;
+}
 
-    #[wasm_bindgen(catch, js_name = fileFolder)]
-    fn file_folder(root: &str, folder: Option<String>) -> Result<String, JsValue>;
+/// Which files the built-in loader of `dereferenceSchemaFrom` reads.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Tsify)]
+#[serde(rename_all = "lowercase")]
+pub enum Files {
+    /// No file. A path or a `file:` URL is refused.
+    #[default]
+    None,
+    /// `.json`, `.yaml` and `.yml` files in one folder and below it.
+    Folder,
+    /// Any file a document names, as json-schema-ref-parser reads them.
+    Any,
+}
 
-    #[wasm_bindgen(catch, js_name = fileUrl)]
-    fn file_url(location: &str) -> Result<String, JsValue>;
+/// What the built-in loader of `dereferenceSchemaFrom` may load.
+///
+/// A document names what it refers to, so the defaults bound what a document
+/// can make the loader load. Turning `sameOrigin` off, setting `files` to
+/// `"any"` and turning `text` on loads what json-schema-ref-parser loads.
+#[derive(Clone, Debug, Deserialize, Serialize, Tsify)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct LoadOptions {
+    /// Fetch only from the origin of the URL that was asked for. With this
+    /// off, a runtime that can look a host up does so, refuses one that
+    /// leads to a private address, and connects to the address it checked.
+    pub same_origin: bool,
+    /// Refuse a URL that names this machine or a private network.
+    pub safe_url_resolver: bool,
+    /// Which files may be read, where the runtime has a file system.
+    pub files: Files,
+    /// The folder [`Files::Folder`] reads from, as a path or a `file:` URL.
+    /// Left out, it is the folder that holds the file that was asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[tsify(optional)]
+    pub folder: Option<String>,
+    /// Take a document named as plain text, such as `.txt` or `.md`, for the
+    /// string it holds, without reading it as JSON or YAML.
+    pub text: bool,
+}
+
+impl Default for LoadOptions {
+    fn default() -> Self {
+        Self {
+            same_origin: true,
+            safe_url_resolver: true,
+            files: Files::None,
+            folder: None,
+            text: false,
+        }
+    }
 }
 
 /// Where the documents a schema refers to come from.
 enum Source {
     /// Whatever the caller's function returns for a URL.
     Resolver(Function),
-    Fetched,
-    /// Files in the folder at this path and below it.
-    Files(String),
+    /// The built-in loader, under the rules the caller set.
+    Loader {
+        policy: JsValue,
+        /// Whether a document named as plain text is the string it holds.
+        text: bool,
+    },
 }
 
 /// Replaces every `$ref` in `schema` with the value it points at.
 ///
 /// The places that refer to one target share one object, so changing it in
-/// one place changes it in all of them. `schema` itself is left untouched.
+/// one place changes it in all of them. `schema` itself is left untouched,
+/// unless `mutateInputSchema` is set: then the result is written into
+/// `schema` and that same object is returned, as json-schema-ref-parser
+/// does. The objects inside it are still new ones.
 ///
 /// # Errors
 ///
@@ -355,15 +589,24 @@ enum Source {
 #[wasm_bindgen(js_name = dereferenceSchema)]
 pub fn dereference_schema(
     schema: &JsValue,
-    options: Option<Ts<Options>>,
+    #[wasm_bindgen(unchecked_optional_param_type = "Options & { mutateInputSchema?: boolean }")]
+    options: &JsValue,
 ) -> Result<Ts<Dereferenced>, JsValue> {
-    let options = read_options(options)?;
-    let schema = serde_json::from_str(&json_of(schema)?).map_err(thrown)?;
+    let (options, mutate) = split_options(options, "mutateInputSchema")?;
+    let untouched = JsValue::UNDEFINED;
+    let into = match mutate {
+        Some(Value::Bool(true)) => schema,
+        Some(Value::Bool(false)) | None => &untouched,
+        Some(
+            Value::Null | Value::Number(_) | Value::String(_) | Value::Array(_) | Value::Object(_),
+        ) => return Err(JsError::new("mutateInputSchema is not true or false").into()),
+    };
+    let document = serde_json::from_str(&json_of(schema)?).map_err(thrown)?;
     let root = Document {
-        root: &schema,
+        root: &document,
         url: None,
     };
-    linked(&root, None, &options)
+    linked(&root, None, &options, into)
 }
 
 /// Loads the document at `url` and every document its references lead to,
@@ -374,13 +617,12 @@ pub fn dereference_schema(
 /// the document or a promise of it. References in a document are relative to
 /// its own URL.
 ///
-/// Without `resolve`, each document is fetched and read as JSON, or as YAML
-/// in a build that has it, under rules that
-/// bound what a document can make it fetch: only `http:` and `https:` URLs,
-/// never one that names this machine or a private network, and only from the
-/// origin of `url`. Redirects are held to the same rules. Pass a `resolve`
-/// to load anything else, and use `dereferenceSchemaFromFile` for a document
-/// on disk.
+/// Without `resolve`, each document is loaded and read as JSON, or as YAML
+/// in a build that has it, under rules that bound what a document can make
+/// it load: only `http:` and `https:` URLs, never one that names this
+/// machine or a private network, and only from the origin of `url`.
+/// Redirects are held to the same rules. The `load` member of `options`
+/// changes the rules, and lets `url` be the path of a file.
 ///
 /// # Errors
 ///
@@ -390,41 +632,29 @@ pub fn dereference_schema(
 #[wasm_bindgen(js_name = dereferenceSchemaFrom)]
 pub async fn dereference_schema_from(
     url: String,
-    #[wasm_bindgen(unchecked_optional_param_type = "Options")] options: Option<Ts<Options>>,
+    #[wasm_bindgen(unchecked_optional_param_type = "Options & { load?: LoadOptions }")]
+    options: JsValue,
     #[wasm_bindgen(unchecked_optional_param_type = "(url: string) => unknown")] resolve: Option<
         Function,
     >,
 ) -> Result<Ts<Dereferenced>, JsValue> {
-    let source = match resolve {
-        Some(resolve) => Source::Resolver(resolve),
-        None => Source::Fetched,
+    let (options, load) = split_options(&options, "load")?;
+    let load: LoadOptions = match load {
+        Some(load) => serde_json::from_value(load).map_err(thrown)?,
+        None => LoadOptions::default(),
     };
-    gathered(&url, &read_options(options)?, &source).await
-}
-
-/// `dereferenceSchemaFrom` for a document on disk, in a runtime that has a
-/// file system. `path` is the path of a file or its `file:` URL.
-///
-/// Each document is read as JSON, or as YAML in a build that has it. A
-/// document can make this read only `.json`, `.yaml` and `.yml` files on
-/// this machine, in `folder` and below it, and nothing over a network.
-/// `folder` is a path or a `file:` URL, and is the folder that holds `path`
-/// when it is left out.
-///
-/// # Errors
-///
-/// Rejects where there is no file system, when a file cannot be read or is
-/// one this does not read, and for every reason `dereferenceSchemaFrom`
-/// rejects.
-#[wasm_bindgen(js_name = dereferenceSchemaFromFile)]
-pub async fn dereference_schema_from_file(
-    path: String,
-    #[wasm_bindgen(unchecked_optional_param_type = "Options")] options: Option<Ts<Options>>,
-    #[wasm_bindgen(unchecked_optional_param_type = "string")] folder: Option<String>,
-) -> Result<Ts<Dereferenced>, JsValue> {
-    let root = file_url(&path)?;
-    let source = Source::Files(file_folder(&root, folder)?);
-    gathered(&root, &read_options(options)?, &source).await
+    let (root, source) = if let Some(resolve) = resolve {
+        (url, Source::Resolver(resolve))
+    } else {
+        let policy = JSON::parse(&serde_json::to_string(&load).map_err(thrown)?)?;
+        let root = locate(&url, &policy)?;
+        let source = Source::Loader {
+            policy,
+            text: load.text,
+        };
+        (root, source)
+    };
+    gathered(&root, &options, &source).await
 }
 
 /// Loads the document at `url` and every document it leads to from `source`,
@@ -454,10 +684,14 @@ async fn gathered(
                 let answer = resolve.call1(&JsValue::NULL, &JsValue::from_str(&next))?;
                 json_of(&JsFuture::from(Promise::resolve(&answer)).await?)?
             }
-            // The loaders stop reading at what is left, so a document too
+            // The loader stops reading at what is left, so a document too
             // large is never held in full.
-            Source::Fetched => text_of(&load(&next, bytes_left, &root)?).await?,
-            Source::Files(folder) => text_of(&load_file(&next, bytes_left, &root, folder)?).await?,
+            Source::Loader { policy, .. } => {
+                JsFuture::from(Promise::resolve(&load(&next, bytes_left, &root, policy)?))
+                    .await?
+                    .as_string()
+                    .ok_or_else(|| JsError::new("the loader did not return text"))?
+            }
         };
         bytes_left = bytes_left.checked_sub(text.len()).ok_or_else(|| {
             thrown(Error::SizeLimitExceeded {
@@ -466,7 +700,8 @@ async fn gathered(
         })?;
         let document = match source {
             Source::Resolver(_) => serde_json::from_str(&text).map_err(thrown)?,
-            Source::Fetched | Source::Files(_) => read(&text, options)?,
+            Source::Loader { text: true, .. } if is_text(&next) => Value::String(text),
+            Source::Loader { .. } => read(&text, options)?,
         };
         // Only what this document refers to is new, so only that is looked
         // at, however many documents came before.
@@ -479,22 +714,45 @@ async fn gathered(
     let Some(document) = documents.get(&root) else {
         return Err(thrown(Error::MissingDocument { url: root }));
     };
-    linked(&document, Some(&documents), options)
+    linked(&document, Some(&documents), options, &JsValue::UNDEFINED)
 }
 
-/// The text a loader promised.
-async fn text_of(promised: &JsValue) -> Result<String, JsValue> {
-    JsFuture::from(Promise::resolve(promised))
-        .await?
-        .as_string()
-        .ok_or_else(|| JsError::new("the loader did not return text").into())
+/// The names that say a document is plain text.
+const TEXT_TYPES: [&str; 12] = [
+    "txt", "htm", "html", "md", "xml", "js", "min", "map", "css", "scss", "less", "svg",
+];
+
+/// Whether the document at `url` is plain text by its name, and so is the
+/// string it holds, as json-schema-ref-parser has it.
+fn is_text(url: &str) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or_default();
+    path.rsplit_once('.').is_some_and(|(_, kind)| {
+        TEXT_TYPES
+            .iter()
+            .any(|text| kind.eq_ignore_ascii_case(text))
+    })
+}
+
+/// The options a caller gave, and their member `name`, which is for this
+/// side of the boundary alone.
+fn split_options(options: &JsValue, name: &str) -> Result<(Options, Option<Value>), JsValue> {
+    if options.is_undefined() || options.is_null() {
+        return Ok((Options::default(), None));
+    }
+    let mut members: Map<String, Value> =
+        serde_json::from_str(&json_of(options)?).map_err(thrown)?;
+    let own = members.remove(name);
+    let options = serde_json::from_value(Value::Object(members)).map_err(thrown)?;
+    Ok((options, own))
 }
 
 /// Dereferences `root` and hands the result to JavaScript as shared objects.
+/// `into` is the caller's own object to write the result into, if any.
 fn linked(
     root: &Document<'_>,
     documents: Option<&Documents>,
     options: &Options,
+    into: &JsValue,
 ) -> Result<Ts<Dereferenced>, JsValue> {
     // The limit is on what the result takes, and shared objects take no more
     // room for being referred to often. The table counts what it writes.
@@ -503,7 +761,7 @@ fn linked(
     // The links in the schema have been followed, so what they point at can
     // go.
     drop(expanded.anchors);
-    Ok(Ts::new_unchecked(link(&table)?))
+    Ok(Ts::new_unchecked(link(&table, into)?))
 }
 
 /// `dereferenceSchema` for a document held as JSON text. Returns the result

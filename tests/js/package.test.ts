@@ -1,14 +1,17 @@
 import assert from "node:assert/strict";
+import dns from "node:dns/promises";
 import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import https from "node:https";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
+import { Readable } from "node:stream";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import init, {
+  type LoadOptions,
   dereferenceSchema,
   dereferenceSchemaFrom,
-  dereferenceSchemaFromFile,
   dereferenceSchemaText,
   schemaStats,
 } from "../../pkg/unbinder.js";
@@ -605,6 +608,9 @@ test("the default loader refuses local and private addresses", async () => {
     "http://10.1.2.3/schema.json",
     "http://172.20.0.1/schema.json",
     "http://192.168.1.1/schema.json",
+    "http://192.0.0.8/schema.json",
+    "http://198.18.0.1/schema.json",
+    "http://203.0.113.7/schema.json",
     "http://169.254.169.254/latest/meta-data",
     "http://[::1]/schema.json",
     "http://service.internal/schema.json",
@@ -667,6 +673,8 @@ test("the default loader stays on the origin it was given", async () => {
 const fixture = (name: string): string =>
   new URL(`./fixtures/${name}`, import.meta.url).href;
 
+const fromFolder: { load: LoadOptions } = { load: { files: "folder" } };
+
 test("reads a document and what it refers to from disk", async () => {
   const path = fileURLToPath(fixture("order.json"));
 
@@ -678,7 +686,7 @@ test("reads a document and what it refers to from disk", async () => {
         path,
         relative(process.cwd(), path),
       ]) {
-        const { schema } = await dereferenceSchemaFromFile(location);
+        const { schema } = await dereferenceSchemaFrom(location, fromFolder);
 
         assert.deepEqual(
           schema,
@@ -702,7 +710,7 @@ test("reads a document and what it refers to from disk", async () => {
 
 test("says which file is not there", async () => {
   await assert.rejects(
-    dereferenceSchemaFromFile(fixture("absent.json")),
+    dereferenceSchemaFrom(fixture("absent.json"), fromFolder),
     /ENOENT/,
   );
 });
@@ -729,8 +737,8 @@ test("a file leads only to files", async () => {
     () => new Response("{}"),
     async () => {
       await assert.rejects(
-        dereferenceSchemaFromFile(fixture("remote.json")),
-        /does not read https:\/\/example\.com\/schemas\/order\.json, which is not a file/,
+        dereferenceSchemaFrom(fixture("remote.json"), fromFolder),
+        /does not fetch https:\/\/example\.com\/schemas\/order\.json, which is on another origin than file:/,
       );
     },
   );
@@ -740,36 +748,36 @@ test("a file leads only to files", async () => {
 
 test("a file leads only to files on this machine", async () => {
   await assert.rejects(
-    dereferenceSchemaFromFile(fixture("share.json")),
+    dereferenceSchemaFrom(fixture("share.json"), fromFolder),
     /does not read file:\/\/files\.example\/share\/schema\.json, which names another machine/,
   );
 });
 
 test("a file leads only to files in its own folder", async () => {
   await assert.rejects(
-    dereferenceSchemaFromFile(fixture("parts/escape.json")),
+    dereferenceSchemaFrom(fixture("parts/escape.json"), fromFolder),
     /does not read file:.*\/fixtures\/shared\.json, which is outside /,
   );
 });
 
 test("reads from the folder it is given", async () => {
-  const { schema } = await dereferenceSchemaFromFile(
-    fixture("parts/escape.json"),
-    {},
-    fileURLToPath(fixture("")),
-  );
+  const { schema } = await dereferenceSchemaFrom(fixture("parts/escape.json"), {
+    load: { files: "folder", folder: fileURLToPath(fixture("")) },
+  });
 
   assert.deepEqual(schema, { above: { type: "integer" } });
 
   await assert.rejects(
-    dereferenceSchemaFromFile(fixture("order.json"), {}, fixture("parts/")),
+    dereferenceSchemaFrom(fixture("order.json"), {
+      load: { files: "folder", folder: fixture("parts/") },
+    }),
     /order\.json, which is outside /,
   );
 });
 
 test("a file leads only to files named as documents", async () => {
   await assert.rejects(
-    dereferenceSchemaFromFile(fixture("notes.json")),
+    dereferenceSchemaFrom(fixture("notes.json"), fromFolder),
     /notes\.txt, which is not a \.json, \.yaml, \.yml file/,
   );
 });
@@ -787,7 +795,7 @@ test("a link does not lead out of the folder", async () => {
     );
 
     await assert.rejects(
-      dereferenceSchemaFromFile(join(folder, "root.json")),
+      dereferenceSchemaFrom(join(folder, "root.json"), fromFolder),
       /linked\.json, which is a link that leads outside /,
     );
 
@@ -801,11 +809,12 @@ test("a link does not lead out of the folder", async () => {
     );
 
     await assert.rejects(
-      dereferenceSchemaFromFile(
-        join(folder, "renamed-root.json"),
-        {},
-        fileURLToPath(new URL("/", fixture(""))),
-      ),
+      dereferenceSchemaFrom(join(folder, "renamed-root.json"), {
+        load: {
+          files: "folder",
+          folder: fileURLToPath(new URL("/", fixture(""))),
+        },
+      }),
       /renamed\.json, which is not a \.json, \.yaml, \.yml file/,
     );
   } finally {
@@ -830,9 +839,247 @@ test("a fetched document cannot make the default loader read a file", async () =
 
 test("stops reading a file that is too large", async () => {
   await assert.rejects(
-    dereferenceSchemaFromFile(fixture("order.json"), { maxBytes: 16 }),
+    dereferenceSchemaFrom(fixture("order.json"), {
+      maxBytes: 16,
+      load: { files: "folder" },
+    }),
     /order\.json is larger than the 16 bytes left to load/,
   );
+});
+
+test("reads any file a document names when told to", async () => {
+  const anyFile: { load: LoadOptions } = { load: { files: "any" } };
+
+  const above = await dereferenceSchemaFrom(
+    fixture("parts/escape.json"),
+    anyFile,
+  );
+
+  assert.deepEqual(above.schema, { above: { type: "integer" } });
+});
+
+test("takes a document named as text for the string it holds on request", async () => {
+  const read = await dereferenceSchemaFrom(fixture("notes.json"), {
+    load: { files: "any" },
+  });
+  const verbatim = await dereferenceSchemaFrom(fixture("notes.json"), {
+    load: { files: "any", text: true },
+  });
+
+  assert.deepEqual(read.schema, { notes: "These are notes, not a schema." });
+  assert.deepEqual(verbatim.schema, {
+    notes: "These are notes, not a schema.\n",
+  });
+});
+
+test("reads a fetched document named as text as a document", async () => {
+  const fetched: Record<string, string> = {
+    [order]: JSON.stringify({ part: { $ref: "part.txt" } }),
+    "https://example.com/schemas/part.txt": JSON.stringify({ type: "null" }),
+  };
+
+  await withFetch(
+    (url) => new Response(fetched[url]),
+    async () => {
+      const { schema } = await dereferenceSchemaFrom(order);
+
+      assert.deepEqual(schema, { part: { type: "null" } });
+    },
+  );
+});
+
+test("a fetched document may name a file when any file may be read", async () => {
+  await withFetch(
+    () => new Response(JSON.stringify({ id: { $ref: fixture("shared.json") } })),
+    async () => {
+      const { schema } = await dereferenceSchemaFrom(order, {
+        load: { files: "any" },
+      });
+
+      assert.deepEqual(schema, {
+        id: { definitions: { id: { type: "integer" } } },
+      });
+    },
+  );
+});
+
+const elsewhere: Record<string, unknown> = {
+  [order]: { part: { $ref: "https://elsewhere.example/part.json" } },
+  "https://elsewhere.example/part.json": { type: "boolean" },
+};
+
+test("fetches from other origins when told to", async () => {
+  const calls = await withFetch(
+    (url) => new Response(JSON.stringify(elsewhere[url])),
+    async () => {
+      const { schema } = await dereferenceSchemaFrom(order, {
+        load: { sameOrigin: false, safeUrlResolver: false },
+      });
+
+      assert.deepEqual(schema, { part: { type: "boolean" } });
+    },
+  );
+
+  assert.equal(calls, 2);
+});
+
+test("fetches from a private host when told to", async () => {
+  const calls = await withFetch(
+    () => new Response(JSON.stringify({ type: "null" })),
+    async () => {
+      const { schema } = await dereferenceSchemaFrom(
+        "http://127.0.0.1:8080/schema.json",
+        { load: { safeUrlResolver: false } },
+      );
+
+      assert.deepEqual(schema, { type: "null" });
+    },
+  );
+
+  assert.equal(calls, 1);
+});
+
+test("refuses a public name that leads to a private address", async (context) => {
+  const answers: Checked[] = [
+    { address: "10.0.0.5", family: 4 },
+    { address: "192.0.2.1", family: 4 },
+    { address: "::1", family: 6 },
+    { address: "fe80::1", family: 6 },
+    { address: "::ffff:10.0.0.5", family: 6 },
+    { address: "64:ff9b::a00:5", family: 6 },
+    { address: "2002:a00:5::1", family: 6 },
+  ];
+  let answer = 0;
+  context.mock.method(dns, "lookup", async () => [
+    { address: "93.184.215.14", family: 4 },
+    answers[answer],
+  ]);
+
+  const calls = await withFetch(
+    () => new Response("{}"),
+    async () => {
+      for (answer = 0; answer < answers.length; answer += 1) {
+        await assert.rejects(
+          dereferenceSchemaFrom(order, { load: { sameOrigin: false } }),
+          /does not fetch https:\/\/example\.com\/schemas\/order\.json, which leads to a local or private address/,
+          answers[answer]?.address,
+        );
+      }
+    },
+  );
+
+  assert.equal(calls, 0);
+});
+
+test("refuses another origin where a host cannot be looked up", async (context) => {
+  context.mock.method(process, "getBuiltinModule", () => undefined);
+  // The globals of a page do not make a server one.
+  for (const name of ["window", "document"]) {
+    Object.defineProperty(globalThis, name, { value: {}, configurable: true });
+  }
+
+  try {
+    const calls = await withFetch(
+      () => new Response("{}"),
+      async () => {
+        await assert.rejects(
+          dereferenceSchemaFrom(order, { load: { sameOrigin: false } }),
+          /which leads somewhere this runtime cannot check/,
+        );
+      },
+    );
+
+    assert.equal(calls, 0);
+  } finally {
+    for (const name of ["window", "document"]) {
+      Reflect.deleteProperty(globalThis, name);
+    }
+  }
+});
+
+interface Checked {
+  address: string;
+  family: number;
+}
+
+interface Pinned {
+  lookup: (
+    hostname: string,
+    options: { all: boolean },
+    callback: (error: Error | null, addresses: Checked[]) => void,
+  ) => void;
+}
+
+test("connects to the address that was checked", async (context) => {
+  const answers: Record<string, string> = {
+    "example.com": "93.184.215.14",
+    "elsewhere.example": "93.184.215.15",
+  };
+  const connected: string[] = [];
+  context.mock.method(dns, "lookup", async (hostname: string) => [
+    { address: answers[hostname], family: 4 },
+  ]);
+  context.mock.method(
+    https,
+    "request",
+    (url: string, options: Pinned, answer: (response: Readable) => void) => ({
+      on() {},
+      end() {
+        options.lookup(new URL(url).hostname, { all: true }, (_, addresses) => {
+          connected.push(...addresses.map(({ address }) => address));
+        });
+        answer(
+          Object.assign(
+            Readable.from([Buffer.from(JSON.stringify(elsewhere[url]))]),
+            {
+              statusCode: 200,
+              headers: {},
+            },
+          ),
+        );
+      },
+    }),
+  );
+
+  const { schema } = await dereferenceSchemaFrom(order, {
+    load: { sameOrigin: false },
+  });
+
+  assert.deepEqual(schema, { part: { type: "boolean" } });
+  assert.deepEqual(connected, ["93.184.215.14", "93.184.215.15"]);
+});
+
+test("rewrites the schema it was given on request", () => {
+  const untouched = structuredClone(recursive);
+  dereferenceSchema(untouched);
+  assert.deepEqual(untouched, recursive);
+
+  const input: Record<string, unknown> = {
+    ...structuredClone(recursive),
+    whole: { $ref: "#" },
+  };
+  const { schema } = dereferenceSchema(input, { mutateInputSchema: true });
+
+  assert.equal(schema, input);
+  assert.equal(input.whole, input);
+  assert.ok(isRecord(input.list) && isRecord(input.list.properties));
+  assert.equal(input.list.properties.next, input.list);
+});
+
+test("drops the keywords next to a reference to true on request", () => {
+  const input = {
+    anything: true,
+    bounded: { $ref: "#/anything", maxLength: 5 },
+  };
+
+  assert.deepEqual(dereferenceSchema(input).schema, {
+    anything: true,
+    bounded: { maxLength: 5 },
+  });
+  assert.deepEqual(dereferenceSchema(input, { trueTarget: "replace" }).schema, {
+    anything: true,
+    bounded: true,
+  });
 });
 
 test("a pointer may leave the slashes of a name unescaped", () => {

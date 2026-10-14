@@ -166,14 +166,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 In JavaScript, `dereferenceSchemaFrom` does the loading. It fetches each
-document and reads it as JSON or YAML, and `dereferenceSchemaFromFile` reads
-them from disk instead. Pass a resolver to get them another way:
+document and reads it as JSON or YAML. Its `load` option sets what it may
+load, and a resolver gets the documents another way:
 
 ```javascript
-import init, {
-    dereferenceSchemaFrom,
-    dereferenceSchemaFromFile,
-} from "unbinder";
+import init, { dereferenceSchemaFrom } from "unbinder";
 
 await init();
 
@@ -182,7 +179,14 @@ const { schema } = await dereferenceSchemaFrom(
 );
 
 // From disk, by path or file: URL, in Node.js, Bun and Deno.
-const fromDisk = await dereferenceSchemaFromFile("schemas/order.json");
+const fromDisk = await dereferenceSchemaFrom("schemas/order.json", {
+    load: { files: "folder" },
+});
+
+// Everything json-schema-ref-parser loads: any public origin and any file.
+const asRefParser = await dereferenceSchemaFrom("schemas/order.json", {
+    load: { sameOrigin: false, files: "any", text: true },
+});
 
 // Or load documents yourself, here with a header the server asks for.
 const withHeader = await dereferenceSchemaFrom(
@@ -193,15 +197,27 @@ const withHeader = await dereferenceSchemaFrom(
 );
 ```
 
-A document names the URLs it refers to, so the built-in loaders bound what a
-document can make them load. A fetched document leads only to `http:` and
-`https:` URLs, never one that names the local machine or a private network,
-and only on the origin of the URL you gave it. Redirects are held to the same
-rules. A file leads only to `.json`, `.yaml` and `.yml` files on this machine,
-in the folder of the file you named or below it, and a link in that folder
-cannot lead out of it. Name another folder as the third argument to read from
-there instead. Both stop reading once the documents pass `maxBytes`. To load
-anything else, pass a resolver.
+A document names the URLs it refers to, so by default the built-in loader
+bounds what a document can make it load: only `http:` and `https:` URLs, never
+one that names the local machine or a private network, only on the origin of
+the URL you gave it, and no file. Redirects are held to the same rules, and it
+stops reading once the documents pass `maxBytes`. `load` changes the rules:
+
+| `load` member     | Default  | Meaning                                              |
+| ----------------- | -------- | ---------------------------------------------------- |
+| `sameOrigin`      | `true`   | Fetch only from the origin of the URL you gave it    |
+| `safeUrlResolver` | `true`   | Refuse a host that is this machine or a private network |
+| `files`           | `"none"` | `"folder"` reads documents in one folder, `"any"` reads any file |
+| `folder`          |          | The folder for `"folder"`, by default the one holding the file you named |
+| `text`            | `false`  | Take a document named as plain text for the string it holds |
+
+With `sameOrigin` off, Node.js, Bun and Deno look each host up, refuse one that
+leads to a private address, and connect to the address they checked. With
+`files: "folder"`, a document reaches only `.json`, `.yaml` and `.yml` files on
+this machine, in the folder or below it, and a link cannot lead out of it.
+`files: "any"` reads whatever file a document names. With `text` on, a
+document named as plain text, such as `.txt` or `.md`, is the string it holds
+and is not read as JSON or YAML.
 
 An `$id` gives a document, or a part of one, a URL of its own that references
 can use, and makes pointers inside that part start at it. As in
@@ -268,6 +284,7 @@ fn main() -> Result<(), Error> {
 | ----------- | -------- | ----------------------------------------------------------- |
 | `circular`  | `Link`   | `Link` a cycle, `Expand` it one level, `Ignore` or `Reject` it |
 | `siblings`  | `Deep`   | Merge sibling objects into the target's, or replace them    |
+| `true_target` | `Keep` | `Keep` the keywords next to a `$ref` to `true`, or `Replace` them with `true` |
 | `max_depth` | 128      | How deep the output may nest                                |
 | `max_bytes` | 256 MiB  | Roughly how much memory the output may take as a tree       |
 | `max_documents` | 1024 | How many documents the references may lead through          |
@@ -322,7 +339,8 @@ import init, { dereferenceSchema, type Options } from "unbinder";
 await init();
 
 const options: Options = { circular: "reject", maxDepth: 64, maxBytes: 1_000_000 };
-// circular: "link" | "expand" | "ignore" | "reject", siblings: "deep" | "shallow"
+// circular: "link" | "expand" | "ignore" | "reject", siblings: "deep" | "shallow",
+// trueTarget: "keep" | "replace"
 
 try {
     dereferenceSchema({ self: { $ref: "#/self" } }, options);
@@ -370,6 +388,7 @@ Counts the `objects`, `arrays` and `references` in a document.
 interface Options {
     circular?: "link" | "expand" | "ignore" | "reject";
     siblings?: "deep" | "shallow";
+    trueTarget?: "keep" | "replace";
     maxDepth?: number;
     maxBytes?: number;
     maxDocuments?: number;
@@ -386,16 +405,22 @@ interface Stats {
     references: number;
 }
 
-function dereferenceSchema(schema: any, options?: Options): Dereferenced;
+interface LoadOptions {
+    sameOrigin?: boolean;
+    safeUrlResolver?: boolean;
+    files?: "none" | "folder" | "any";
+    folder?: string;
+    text?: boolean;
+}
+
+function dereferenceSchema(
+    schema: any,
+    options?: Options & { mutateInputSchema?: boolean },
+): Dereferenced;
 function dereferenceSchemaFrom(
     url: string,
-    options?: Options,
+    options?: Options & { load?: LoadOptions },
     resolve?: (url: string) => unknown,
-): Promise<Dereferenced>;
-function dereferenceSchemaFromFile(
-    path: string,
-    options?: Options,
-    folder?: string,
 ): Promise<Dereferenced>;
 function dereferenceSchemaText(json: string, options?: Options): string;
 function schemaStats(schema: any): Stats;
@@ -449,25 +474,27 @@ Run it with `pixi run bench`.
     JavaScript package always has it.
 -   `wasm`: the JavaScript bindings. Off by default, so a Rust program that
     targets WebAssembly does not export them.
--   `yaml`: lets `dereferenceSchemaFrom` and `dereferenceSchemaFromFile` read
-    YAML documents as well as JSON.
+-   `yaml`: lets `dereferenceSchemaFrom` read YAML documents as well as JSON.
     The published JavaScript package is built with it. The YAML parser is
     most of that module's size, so a build without it is about a third as
     large.
 
 ## Limitations
 
--   A reference into another document is followed only through `Documents`,
-    `dereferenceSchemaFrom` or `dereferenceSchemaFromFile`.
-    `dereference_schema` and `dereferenceSchema` take one document and report
-    such a reference as an error.
+-   A reference into another document is followed only through `Documents`
+    or `dereferenceSchemaFrom`. `dereference_schema` and `dereferenceSchema`
+    take one document and report such a reference as an error.
 -   A circular reference left in place inside a document that was loaded
     stays as written, relative to that document and not to the output.
 -   A pointer that passes through a `$ref` with sibling keywords finds the
     siblings first and the target's members second. It does not see the two
     merged, so it cannot reach into an object that deep merging would combine.
 -   Keywords next to a `$ref` are kept as they are when its target is the
-    schema `true`, and dropped when it is `false` or is not a schema.
+    schema `true`, unless `true_target` says otherwise, and dropped when it is
+    `false` or is not a schema.
+-   `mutateInputSchema` writes the result into the object you passed and
+    returns that object. The objects inside it are new ones, and a value JSON
+    cannot hold is not carried over.
 -   Every object with a string `$ref` member is treated as a reference,
     including one inside `enum`, `const`, `default` or `examples`.
 -   A reference written under the name `$ref` that points at a string is an

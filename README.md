@@ -8,7 +8,7 @@ self-contained by replacing references with their actual content.
 
 -   **Complete**: inlines every internal reference, including references
     inside inlined targets and references to other references
--   **Fast**: ~5.5x faster than json-schema-ref-parser
+-   **Fast**: ~4.3x faster than json-schema-ref-parser
 -   **Same on both sides**: a Rust server runs the crate natively and the
     frontend runs it as WebAssembly, so both validate against exactly the
     same dereferenced schema
@@ -435,7 +435,7 @@ pixi run publish:jsr
 
 ## Benchmark
 
-~5.5x faster than
+~4.3x faster than
 [json-schema-ref-parser](https://github.com/APIDevTools/json-schema-ref-parser).
 
 Run it with `pixi run bench`.

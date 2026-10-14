@@ -5,6 +5,15 @@ use core::fmt;
 
 /// Why a document could not be dereferenced.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "wasm",
+    derive(serde::Serialize, tsify::Tsify),
+    serde(
+        tag = "kind",
+        rename_all = "camelCase",
+        rename_all_fields = "camelCase"
+    )
+)]
 pub enum Error {
     /// A reference points outside the document, and the document was
     /// dereferenced on its own. [`Documents`] follows such references.
@@ -70,6 +79,37 @@ pub enum Error {
         /// The limit that was in effect.
         limit: usize,
     },
+    /// The run took longer than a [`Hooks`] implementation allows.
+    ///
+    /// [`Hooks`]: crate::Hooks
+    TimeLimitExceeded {
+        /// The limit that was in effect, in milliseconds.
+        limit: u64,
+    },
+    /// A [`Hooks`] implementation stopped the run.
+    ///
+    /// [`Hooks`]: crate::Hooks
+    Interrupted,
+}
+
+impl Error {
+    /// Whether the error is about one reference, which the run can carry on
+    /// without, as opposed to a limit or a choice that ends it.
+    pub(crate) const fn is_recoverable(&self) -> bool {
+        match self {
+            Self::ExternalReference { .. }
+            | Self::InvalidUrl { .. }
+            | Self::MissingDocument { .. }
+            | Self::UnresolvedReference { .. } => true,
+            Self::CircularReference { .. }
+            | Self::ReferenceToReference { .. }
+            | Self::DepthLimitExceeded { .. }
+            | Self::DocumentLimitExceeded { .. }
+            | Self::SizeLimitExceeded { .. }
+            | Self::TimeLimitExceeded { .. }
+            | Self::Interrupted => false,
+        }
+    }
 }
 
 impl fmt::Display for Error {
@@ -109,6 +149,10 @@ impl fmt::Display for Error {
             Self::SizeLimitExceeded { limit } => {
                 write!(formatter, "output takes more than {limit} bytes")
             }
+            Self::TimeLimitExceeded { limit } => {
+                write!(formatter, "took longer than {limit} ms")
+            }
+            Self::Interrupted => formatter.write_str("stopped by a hook"),
         }
     }
 }
@@ -119,6 +163,15 @@ impl core::error::Error for Error {}
 ///
 /// [RFC 6901]: https://datatracker.ietf.org/doc/html/rfc6901
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "wasm",
+    derive(serde::Serialize, tsify::Tsify),
+    serde(
+        tag = "kind",
+        rename_all = "camelCase",
+        rename_all_fields = "camelCase"
+    )
+)]
 pub enum PointerError {
     /// The fragment does not decode to UTF-8 once its percent-encoding is
     /// removed.

@@ -239,7 +239,9 @@ proptest! {
                 | Error::ReferenceToReference { .. }
                 | Error::DocumentLimitExceeded { .. }
                 | Error::DepthLimitExceeded { .. }
-                | Error::SizeLimitExceeded { .. }),
+                | Error::SizeLimitExceeded { .. }
+                | Error::TimeLimitExceeded { .. }
+                | Error::Interrupted),
             ) => return Err(unexpected.into()),
         }
     }

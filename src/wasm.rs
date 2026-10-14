@@ -18,19 +18,24 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use js_sys::{Function, JSON, Promise};
+use alloc::borrow::ToOwned;
+use alloc::format;
+use alloc::string::ToString;
+
+use js_sys::{Date, Function, JSON, Promise, Reflect};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tsify::{Ts, Tsify};
+use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::{JsError, JsValue, wasm_bindgen};
 use wasm_bindgen_futures::JsFuture;
 
 use crate::dereference::{Form, expand};
 use crate::documents::Document;
+use crate::hooks::{Hooks, Place, Step, fragment};
 use crate::shared::{Anchor, Shared};
-use crate::{
-    Dereferenced, Documents, Error, Options, SharedSchema, Stats, dereference_schema_shared,
-};
+use crate::walk::reference_of;
+use crate::{Documents, Error, Options, SharedSchema, Stats, dereference_schema_shared};
 
 #[wasm_bindgen(inline_js = r#"
 // Builds the result from a table of entries. An entry is a value with holes
@@ -42,8 +47,26 @@ use crate::{
 // `into` is the object the caller wants rewritten in place of getting a new
 // one. It takes the members of the result before any link is made, so every
 // link to the result leads to it.
+// Writes the members of `result` into `into`, which loses its own.
+export function rewrite(into, result) {
+  if (Array.isArray(into)) {
+    into.length = 0;
+  }
+  for (const name of Object.keys(into)) {
+    delete into[name];
+  }
+  for (const name of Object.keys(result)) {
+    Object.defineProperty(into, name, {
+      value: result[name],
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    });
+  }
+}
+
 export function link(text, into) {
-  const { nodes, root, circular } = JSON.parse(text);
+  const { nodes, root, ...rest } = JSON.parse(text);
   // Defining a property keeps a member named __proto__ a plain member.
   const define = (holder, name, value) =>
     Object.defineProperty(holder, name, {
@@ -137,7 +160,7 @@ export function link(text, into) {
       }
     }
   }
-  return { schema: nodes[root][0], circular };
+  return { schema: nodes[root][0], ...rest };
 }
 
 const privateSuffixes = [
@@ -233,23 +256,30 @@ function refusal(url, root, policy) {
   return undefined;
 }
 
-// Gathers the pieces `next` hands out into text, giving up once they pass
-// `limit` bytes. `next` resolves to nothing when there are no more.
+// Gathers the pieces `next` hands out, giving up once they pass `limit`
+// bytes. `next` resolves to nothing when there are no more, and may reuse
+// the memory of a piece for the next one.
 async function gather(next, limit, url) {
-  const decoder = new TextDecoder();
-  let text = "";
+  const pieces = [];
   let bytes = 0;
   for (;;) {
     const piece = await next();
     if (piece === undefined) {
-      return text + decoder.decode();
+      break;
     }
     bytes += piece.byteLength;
     if (bytes > limit) {
       throw new Error(`${url} is larger than the ${limit} bytes left to load`);
     }
-    text += decoder.decode(piece, { stream: true });
+    pieces.push(piece.slice());
   }
+  const gathered = new Uint8Array(bytes);
+  let offset = 0;
+  for (const piece of pieces) {
+    gathered.set(piece, offset);
+    offset += piece.byteLength;
+  }
+  return gathered;
 }
 
 // One of the modules a runtime with a file system comes with. A browser has
@@ -274,8 +304,8 @@ export function locate(location, policy) {
 
 const documentTypes = [".json", ".yaml", ".yml"];
 
-// Reads the file at `url` as text of at most `limit` bytes. `root` is the
-// URL of the document the caller asked for.
+// Reads at most `limit` bytes of the file at `url`. `root` is the URL of the
+// document the caller asked for.
 //
 // It reads files on this machine only. Under the "folder" rule a document
 // can make it read only in one folder or below it: the one the caller named,
@@ -373,20 +403,47 @@ async function checked(url) {
   return found;
 }
 
-// Sends one request for `url`, which gets a minute. With `pinned`, the
-// addresses its host was checked to lead to, the connection is made to one
-// of those, so that a second lookup cannot lead anywhere else.
-async function get(url, pinned, limit) {
-  const signal = AbortSignal.timeout(60_000);
+// The headers a connection to a checked address sets itself.
+const fixed = [
+  "accept-encoding",
+  "connection",
+  "content-length",
+  "expect",
+  "host",
+  "keep-alive",
+  "proxy-connection",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+];
+
+const without = (headers, names) =>
+  Object.fromEntries(
+    Object.entries(headers).filter(([name]) => !names.includes(name.toLowerCase())),
+  );
+
+// Sends one request for `url`, which gets `policy.timeoutMs`. `own` says
+// whether it may carry the headers and credentials the caller gave. With
+// `pinned`, the addresses its host was checked to lead to, the connection is
+// made to one of those, so that a second lookup cannot lead anywhere else.
+async function get(url, pinned, limit, policy, own) {
+  const signal = AbortSignal.timeout(policy.timeoutMs);
+  const headers = own ? policy.headers ?? {} : {};
   if (pinned === undefined) {
-    const response = await fetch(url, { redirect: "manual", signal });
+    const response = await fetch(url, {
+      redirect: "manual",
+      signal,
+      headers,
+      credentials: own ? policy.credentials : "same-origin",
+    });
     return {
       status: response.status,
       location: response.headers.get("location"),
       opaque: response.type === "opaqueredirect",
-      text: async () => {
+      bytes: async () => {
         if (response.body === null) {
-          return "";
+          return new Uint8Array(0);
         }
         const reader = response.body.getReader();
         return gather(
@@ -425,7 +482,7 @@ async function get(url, pinned, limit) {
       url,
       {
         method: "GET",
-        headers: { accept: "*/*", "accept-encoding": "identity" },
+        headers: { accept: "*/*", ...without(headers, fixed), "accept-encoding": "identity" },
         lookup,
         agent: false,
         signal,
@@ -439,7 +496,7 @@ async function get(url, pinned, limit) {
     status: response.statusCode,
     location: response.headers.location ?? null,
     opaque: false,
-    text: async () => {
+    bytes: async () => {
       const encoding = response.headers["content-encoding"] ?? "identity";
       if (encoding !== "identity") {
         throw new Error(`${url} answered in the encoding ${encoding}, which was not asked for`);
@@ -460,16 +517,19 @@ async function get(url, pinned, limit) {
   };
 }
 
-// Loads a document the way a caller who gives no other way gets: as text of
-// at most `limit` bytes, under the rules in `policy`. `root` is the URL of
-// the document the caller asked for. A redirect is followed only where its
-// target can be seen and passes the same checks.
-export async function load(url, limit, root, policy) {
+// Loads at most `limit` bytes of a document the way a caller who gives no
+// other way gets it, under the rules in `policy`. `root` is the URL of the
+// document the caller asked for. A redirect is followed only where its
+// target can be seen and passes the same checks. The headers and
+// credentials the caller gave go only to the origin of `root`, since a
+// document can name any origin and any of them may carry a secret.
+async function loadBytes(url, limit, root, policy) {
   if (policy.files !== "none" && new URL(url).protocol === "file:") {
     return loadFile(url, limit, root, policy);
   }
+  const origin = new URL(root).origin;
   let target = url;
-  for (let hops = 0; hops <= 5; hops += 1) {
+  for (let hops = 0; hops <= policy.redirects; hops += 1) {
     const reason = refusal(target, root, policy);
     if (reason !== undefined) {
       throw refused("fetch", target, reason);
@@ -478,7 +538,7 @@ export async function load(url, limit, root, policy) {
     const pinned = policy.safeUrlResolver && !policy.sameOrigin
       ? await checked(target)
       : undefined;
-    const response = await get(target, pinned, limit);
+    const response = await get(target, pinned, limit, policy, new URL(target).origin === origin);
     try {
       if (response.status >= 300 && response.status < 400 && response.location) {
         target = new URL(response.location, target).href;
@@ -492,12 +552,17 @@ export async function load(url, limit, root, policy) {
       if (response.status < 200 || response.status >= 300) {
         throw new Error(`${target} answered ${response.status}`);
       }
-      return await response.text();
+      return await response.bytes();
     } finally {
       await response.discard();
     }
   }
-  throw new Error(`${url} redirects too many times`);
+  throw new Error(`${url} redirects more than ${policy.redirects} times`);
+}
+
+// `loadBytes`, read as UTF-8 text.
+export async function load(url, limit, root, policy) {
+  return new TextDecoder().decode(await loadBytes(url, limit, root, policy));
 }
 "#)]
 extern "C" {
@@ -506,6 +571,9 @@ extern "C" {
 
     #[wasm_bindgen(catch)]
     fn load(url: &str, limit: usize, root: &str, policy: &JsValue) -> Result<JsValue, JsValue>;
+
+    #[wasm_bindgen(catch)]
+    fn rewrite(into: &JsValue, result: &JsValue) -> Result<(), JsValue>;
 
     #[wasm_bindgen(catch)]
     fn locate(location: &str, policy: &JsValue) -> Result<String, JsValue>;
@@ -522,6 +590,20 @@ pub enum Files {
     Folder,
     /// Any file a document names, as json-schema-ref-parser reads them.
     Any,
+}
+
+/// Which requests of the built-in loader carry cookies and credentials, as
+/// the `credentials` option of `fetch` says.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Tsify)]
+#[serde(rename_all = "kebab-case")]
+pub enum Credentials {
+    /// Those to the origin of the page.
+    #[default]
+    SameOrigin,
+    /// Every one, to any origin.
+    Include,
+    /// None.
+    Omit,
 }
 
 /// What the built-in loader of `dereferenceSchemaFrom` may load.
@@ -548,6 +630,26 @@ pub struct LoadOptions {
     /// Take a document named as plain text, such as `.txt` or `.md`, for the
     /// string it holds, without reading it as JSON or YAML.
     pub text: bool,
+    /// Headers to send with each request to the origin of the URL that was
+    /// asked for. A request anywhere else, a redirect included, sends none.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[tsify(optional, type = "Record<string, string>")]
+    pub headers: BTreeMap<String, String>,
+    /// How long one request may take, in milliseconds.
+    pub timeout_ms: u32,
+    /// How many redirects one document may follow.
+    pub redirects: u32,
+    /// Which requests to the origin of the URL that was asked for carry
+    /// cookies and credentials, in a browser. Requests anywhere else carry
+    /// them only to the origin of the page.
+    pub credentials: Credentials,
+}
+
+impl LoadOptions {
+    /// The default for [`LoadOptions::timeout_ms`], a minute.
+    pub const DEFAULT_TIMEOUT_MS: u32 = 60_000;
+    /// The default for [`LoadOptions::redirects`].
+    pub const DEFAULT_REDIRECTS: u32 = 5;
 }
 
 impl Default for LoadOptions {
@@ -558,6 +660,167 @@ impl Default for LoadOptions {
             files: Files::None,
             folder: None,
             text: false,
+            headers: BTreeMap::new(),
+            timeout_ms: Self::DEFAULT_TIMEOUT_MS,
+            redirects: Self::DEFAULT_REDIRECTS,
+            credentials: Credentials::SameOrigin,
+        }
+    }
+}
+
+/// The members a JavaScript caller gives that only a JavaScript caller can.
+#[wasm_bindgen(typescript_custom_section)]
+const HOOKS: &str = r#"
+/** Callbacks a run makes as it goes. */
+export interface Hooks {
+    /**
+     * Whether to leave the value at `path` in the output, a JSON Pointer in a
+     * URI fragment, and everything inside it as written. Asked of every
+     * value the run reaches, and again of a target where a reference first
+     * reaches it.
+     */
+    excluded?: (path: string, value: unknown) => boolean;
+    /** Called with where each reference that takes part in a cycle is written. */
+    onCircular?: (source: string) => void;
+    /** Called with each reference replaced, what replaced it, and where. */
+    onDereference?: (reference: string, value: unknown, parent: unknown, key: string | undefined) => void;
+    /** Called with each member a bundle looked through that has a `$ref` member. */
+    onBundle?: (reference: unknown, value: unknown, parent: unknown, key: string | undefined) => void;
+}
+"#;
+
+/// The names of the members of `Hooks`.
+const CALLBACKS: [&str; 4] = ["excluded", "onCircular", "onDereference", "onBundle"];
+
+/// Options of a run that only a JavaScript caller sets.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Tsify)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct RunOptions {
+    /// Stop with an error once the run has taken this many milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[tsify(optional)]
+    pub timeout_ms: Option<u32>,
+    /// Carry on past a reference that cannot be resolved, which becomes
+    /// `null`, and list it in `errors`.
+    pub continue_on_error: bool,
+    /// Give every place that refers to a target its own copy of it, except
+    /// where the copy would hold a cycle.
+    pub clone_references: bool,
+}
+
+/// The names of the members of `RunOptions`.
+const RUN_OPTIONS: [&str; 3] = ["timeoutMs", "continueOnError", "cloneReferences"];
+
+/// A reference that could not be resolved, which a run carried on past.
+#[derive(Clone, Debug, Serialize, Tsify)]
+pub struct Unresolved {
+    /// Why it could not be resolved.
+    pub error: Error,
+    /// Where the reference is written, as a URL with a JSON Pointer in its
+    /// fragment.
+    pub source: String,
+}
+
+/// A bundled document.
+#[derive(Clone, Debug, Serialize, Tsify)]
+pub struct Bundled {
+    /// The bundle.
+    #[tsify(type = "unknown")]
+    pub schema: Value,
+    /// The references a run with `continueOnError` carried on past.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[tsify(optional)]
+    pub errors: Option<Vec<Unresolved>>,
+}
+
+/// The callbacks in `Hooks`.
+#[derive(Default)]
+struct Callbacks {
+    excluded: Option<Function>,
+    on_circular: Option<Function>,
+    on_dereference: Option<Function>,
+    on_bundle: Option<Function>,
+}
+
+/// What a JavaScript caller gave in its options.
+struct Given {
+    options: Options,
+    run: RunOptions,
+    callbacks: Callbacks,
+    /// The member named for the function it was given to, if any.
+    own: Option<Value>,
+}
+
+impl Given {
+    /// Reads `options`, whose member `own` is for the function they were
+    /// given to.
+    fn read(options: &JsValue, own: &str) -> Result<Self, JsValue> {
+        if options.is_undefined() || options.is_null() {
+            return Ok(Self {
+                options: Options::default(),
+                run: RunOptions::default(),
+                callbacks: Callbacks::default(),
+                own: None,
+            });
+        }
+        let callback = |name: &str| -> Result<Option<Function>, JsValue> {
+            let member = Reflect::get(options, &JsValue::from_str(name))?;
+            if member.is_undefined() {
+                return Ok(None);
+            }
+            if !member.is_function() {
+                return Err(JsError::new(&format!("{name} is not a function")).into());
+            }
+            Ok(Some(member.unchecked_into::<Function>()))
+        };
+        let callbacks = Callbacks {
+            excluded: callback("excluded")?,
+            on_circular: callback("onCircular")?,
+            on_dereference: callback("onDereference")?,
+            on_bundle: callback("onBundle")?,
+        };
+        let mut members: Map<String, Value> =
+            serde_json::from_str(&json_of(options)?).map_err(thrown)?;
+        for name in CALLBACKS {
+            members.remove(name);
+        }
+        let own = members.remove(own);
+        let run: Map<String, Value> = RUN_OPTIONS
+            .iter()
+            .filter_map(|name| {
+                members
+                    .remove(*name)
+                    .map(|value| ((*name).to_owned(), value))
+            })
+            .collect();
+        Ok(Self {
+            options: serde_json::from_value(Value::Object(members)).map_err(thrown)?,
+            run: serde_json::from_value(Value::Object(run)).map_err(thrown)?,
+            callbacks,
+            own,
+        })
+    }
+
+    /// The load options a function that loads documents was given.
+    fn load(&self) -> Result<LoadOptions, JsValue> {
+        match &self.own {
+            Some(load) => serde_json::from_value(load.clone()).map_err(thrown),
+            None => Ok(LoadOptions::default()),
+        }
+    }
+
+    /// Whether the result is to be written into the caller's own object.
+    fn mutates(&self) -> Result<bool, JsValue> {
+        match &self.own {
+            Some(Value::Bool(mutate)) => Ok(*mutate),
+            None => Ok(false),
+            Some(
+                Value::Null
+                | Value::Number(_)
+                | Value::String(_)
+                | Value::Array(_)
+                | Value::Object(_),
+            ) => Err(JsError::new("mutateInputSchema is not true or false").into()),
         }
     }
 }
@@ -574,6 +837,27 @@ enum Source {
     },
 }
 
+impl Source {
+    fn of(
+        url: String,
+        load: &LoadOptions,
+        resolve: Option<Function>,
+    ) -> Result<(String, Self), JsValue> {
+        if let Some(resolve) = resolve {
+            return Ok((url, Self::Resolver(resolve)));
+        }
+        let policy = JSON::parse(&serde_json::to_string(load).map_err(thrown)?)?;
+        let root = locate(&url, &policy)?;
+        Ok((
+            root,
+            Self::Loader {
+                policy,
+                text: load.text,
+            },
+        ))
+    }
+}
+
 /// Replaces every `$ref` in `schema` with the value it points at.
 ///
 /// The places that refer to one target share one object, so changing it in
@@ -585,28 +869,32 @@ enum Source {
 /// # Errors
 ///
 /// Throws an `Error` when `schema` or `options` cannot be read, when a
-/// reference cannot be resolved, and when the result exceeds a limit.
-#[wasm_bindgen(js_name = dereferenceSchema)]
+/// reference cannot be resolved, unless `continueOnError` is set, when the
+/// result exceeds a limit, and with whatever a callback throws.
+#[wasm_bindgen(
+    js_name = dereferenceSchema,
+    unchecked_return_type = "Dereferenced & { errors?: Unresolved[] }"
+)]
 pub fn dereference_schema(
     schema: &JsValue,
-    #[wasm_bindgen(unchecked_optional_param_type = "Options & { mutateInputSchema?: boolean }")]
+    #[wasm_bindgen(
+        unchecked_optional_param_type = "Options & RunOptions & Hooks & { mutateInputSchema?: boolean }"
+    )]
     options: &JsValue,
-) -> Result<Ts<Dereferenced>, JsValue> {
-    let (options, mutate) = split_options(options, "mutateInputSchema")?;
-    let untouched = JsValue::UNDEFINED;
-    let into = match mutate {
-        Some(Value::Bool(true)) => schema,
-        Some(Value::Bool(false)) | None => &untouched,
-        Some(
-            Value::Null | Value::Number(_) | Value::String(_) | Value::Array(_) | Value::Object(_),
-        ) => return Err(JsError::new("mutateInputSchema is not true or false").into()),
+) -> Result<JsValue, JsValue> {
+    let given = Given::read(options, "mutateInputSchema")?;
+    let into = if given.mutates()? {
+        schema.clone()
+    } else {
+        JsValue::UNDEFINED
     };
     let document = serde_json::from_str(&json_of(schema)?).map_err(thrown)?;
     let root = Document {
         root: &document,
         url: None,
     };
-    linked(&root, None, &options, into)
+    let mut hooks = JsHooks::new(&given, None, schema.clone());
+    dereferenced(&root, None, &given, &into, &mut hooks)
 }
 
 /// Loads the document at `url` and every document its references lead to,
@@ -629,51 +917,305 @@ pub fn dereference_schema(
 /// Rejects when a document cannot be loaded or read, when the documents
 /// together are larger than `maxBytes` or more than `maxDocuments`, and for
 /// every reason `dereferenceSchema` throws.
-#[wasm_bindgen(js_name = dereferenceSchemaFrom)]
+#[wasm_bindgen(
+    js_name = dereferenceSchemaFrom,
+    unchecked_return_type = "Promise<Dereferenced & { errors?: Unresolved[] }>"
+)]
 pub async fn dereference_schema_from(
+    url: String,
+    #[wasm_bindgen(
+        unchecked_optional_param_type = "Options & RunOptions & Hooks & { load?: LoadOptions }"
+    )]
+    options: JsValue,
+    #[wasm_bindgen(unchecked_optional_param_type = "(url: string) => unknown")] resolve: Option<
+        Function,
+    >,
+) -> Result<JsValue, JsValue> {
+    let given = Given::read(&options, "load")?;
+    let (root, source) = Source::of(url, &given.load()?, resolve)?;
+    let documents = gathered(&root, &given.options, &source).await?;
+    let root = documents.root(&root).map_err(|error| failure(&error))?;
+    let mut hooks = JsHooks::new(&given, Some(&documents), JsValue::UNDEFINED);
+    dereferenced(
+        &root,
+        Some(&documents),
+        &given,
+        &JsValue::UNDEFINED,
+        &mut hooks,
+    )
+}
+
+/// Bundles `schema`: every reference in it is pointed straight at the value
+/// it leads to, past any reference on the way, unless `internal` is
+/// `"written"`. `schema` is left untouched, unless `mutateInputSchema` is
+/// set: then the bundle is written into `schema`.
+///
+/// # Errors
+///
+/// Throws when `schema` or `options` cannot be read, when a reference cannot
+/// be resolved or points outside `schema`, unless `continueOnError` is set,
+/// and with whatever a callback throws.
+#[wasm_bindgen(js_name = bundleSchema)]
+pub fn bundle_schema(
+    schema: &JsValue,
+    #[wasm_bindgen(
+        unchecked_optional_param_type = "Options & RunOptions & Hooks & { mutateInputSchema?: boolean }"
+    )]
+    options: &JsValue,
+) -> Result<Ts<Bundled>, JsValue> {
+    let given = Given::read(options, "mutateInputSchema")?;
+    let document: Value = serde_json::from_str(&json_of(schema)?).map_err(thrown)?;
+    let mut hooks = JsHooks::new(&given, None, schema.clone());
+    let bundled = crate::bundle_schema_with_hooks(&document, &given.options, &mut hooks);
+    let bundled = hooks.finish(bundled)?;
+    let into = if given.mutates()? {
+        schema.clone()
+    } else {
+        JsValue::UNDEFINED
+    };
+    hooks.after_bundle(bundled, &into)
+}
+
+/// Loads the document at `url` and every document its references lead to, as
+/// `dereferenceSchemaFrom` does, and bundles them: what references to other
+/// documents point at is written into the document, once each, at the first
+/// place that refers to it as json-schema-ref-parser chooses it, and every
+/// other reference to it, or into it, points there. Every reference left
+/// points within the bundle.
+///
+/// # Errors
+///
+/// Rejects for the reasons `dereferenceSchemaFrom` does, and when the bundle
+/// nests deeper than `maxDepth`.
+#[wasm_bindgen(js_name = bundleSchemaFrom, unchecked_return_type = "Promise<Bundled>")]
+pub async fn bundle_schema_from(
+    url: String,
+    #[wasm_bindgen(
+        unchecked_optional_param_type = "Options & RunOptions & Hooks & { load?: LoadOptions }"
+    )]
+    options: JsValue,
+    #[wasm_bindgen(unchecked_optional_param_type = "(url: string) => unknown")] resolve: Option<
+        Function,
+    >,
+) -> Result<JsValue, JsValue> {
+    let given = Given::read(&options, "load")?;
+    let (root, source) = Source::of(url, &given.load()?, resolve)?;
+    let documents = gathered(&root, &given.options, &source).await?;
+    bundled(&documents, &root, &given).map(|bundled| bundled.js_value().clone())
+}
+
+/// Loads the document at `url` and every document its references lead to,
+/// as `dereferenceSchemaFrom` does, without dereferencing them. With
+/// `external` set to `"ignore"`, only the document at `url` is loaded.
+///
+/// # Errors
+///
+/// Rejects when a document cannot be loaded or read, and when the documents
+/// together are larger than `maxBytes` or more than `maxDocuments`.
+#[wasm_bindgen(js_name = resolveSchemaFrom)]
+pub async fn resolve_schema_from(
     url: String,
     #[wasm_bindgen(unchecked_optional_param_type = "Options & { load?: LoadOptions }")]
     options: JsValue,
     #[wasm_bindgen(unchecked_optional_param_type = "(url: string) => unknown")] resolve: Option<
         Function,
     >,
-) -> Result<Ts<Dereferenced>, JsValue> {
-    let (options, load) = split_options(&options, "load")?;
-    let load: LoadOptions = match load {
-        Some(load) => serde_json::from_value(load).map_err(thrown)?,
-        None => LoadOptions::default(),
-    };
-    let (root, source) = if let Some(resolve) = resolve {
-        (url, Source::Resolver(resolve))
-    } else {
-        let policy = JSON::parse(&serde_json::to_string(&load).map_err(thrown)?)?;
-        let root = locate(&url, &policy)?;
-        let source = Source::Loader {
-            policy,
-            text: load.text,
-        };
-        (root, source)
-    };
-    gathered(&root, &options, &source).await
+) -> Result<Resolved, JsValue> {
+    let given = Given::read(&options, "load")?;
+    let (root, source) = Source::of(url, &given.load()?, resolve)?;
+    let documents = gathered(&root, &given.options, &source).await?;
+    let url = Documents::normalized(&root).map_err(|error| failure(&error))?;
+    Ok(Resolved { documents, url })
 }
 
-/// Loads the document at `url` and every document it leads to from `source`,
-/// then dereferences it.
-async fn gathered(
-    url: &str,
-    options: &Options,
-    source: &Source,
-) -> Result<Ts<Dereferenced>, JsValue> {
+/// A document and every document its references lead to, loaded.
+#[wasm_bindgen]
+#[derive(Debug)]
+pub struct Resolved {
+    documents: Documents,
+    url: String,
+}
+
+#[wasm_bindgen]
+impl Resolved {
+    /// The absolute URL of the document that was asked for.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn url(&self) -> String {
+        self.url.clone()
+    }
+
+    /// The absolute URLs of every document loaded, sorted.
+    #[must_use]
+    pub fn urls(&self) -> Vec<String> {
+        self.documents
+            .urls()
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect()
+    }
+
+    /// The value `reference` points at, a copy. `reference` is resolved
+    /// against the URL of the document that was asked for, so `#/a` is in
+    /// that document. A pointer passes through any reference on its way, and
+    /// a bare reference where it ends is followed.
+    ///
+    /// # Errors
+    ///
+    /// Throws when the document is not loaded or the pointer does not
+    /// resolve.
+    pub fn get(&self, reference: &str) -> Result<JsValue, JsValue> {
+        let value = self
+            .documents
+            .lookup(&self.absolute(reference)?, &Options::default())
+            .map_err(|error| failure(&error))?;
+        JSON::parse(&serde_json::to_string(&value).map_err(thrown)?)
+    }
+
+    /// Whether `reference` points at a value, as `get` resolves it.
+    #[must_use]
+    pub fn exists(&self, reference: &str) -> bool {
+        match self.absolute(reference) {
+            Ok(reference) => self
+                .documents
+                .lookup(&reference, &Options::default())
+                .is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    /// Puts `value` where `reference` points, resolved as `get` resolves it.
+    /// Members missing on the way are added as empty objects, and `-` as the
+    /// last token of a pointer into an array adds an item at its end.
+    ///
+    /// # Errors
+    ///
+    /// Throws when the document is not loaded, when the pointer passes
+    /// through a value that holds nothing, and when `value` is not JSON
+    /// data.
+    pub fn set(&mut self, reference: &str, value: &JsValue) -> Result<(), JsValue> {
+        let value = serde_json::from_str(&json_of(value)?).map_err(thrown)?;
+        let reference = self.absolute(reference)?;
+        self.documents
+            .set(&reference, value)
+            .map_err(|error| failure(&error))
+    }
+
+    /// Every document loaded, by absolute URL.
+    ///
+    /// # Errors
+    ///
+    /// Throws only if a document cannot be handed over.
+    #[wasm_bindgen(js_name = toJSON, unchecked_return_type = "Record<string, unknown>")]
+    pub fn to_json(&self) -> Result<JsValue, JsValue> {
+        let documents: Map<String, Value> = self
+            .documents
+            .urls()
+            .into_iter()
+            .filter_map(|url| {
+                self.documents
+                    .document(url)
+                    .map(|document| (url.to_owned(), document.clone()))
+            })
+            .collect();
+        JSON::parse(&serde_json::to_string(&documents).map_err(thrown)?)
+    }
+
+    /// Dereferences the document that was asked for, as
+    /// `dereferenceSchemaFrom` does.
+    ///
+    /// # Errors
+    ///
+    /// Throws for the reasons `dereferenceSchema` does.
+    #[wasm_bindgen(unchecked_return_type = "Dereferenced & { errors?: Unresolved[] }")]
+    pub fn dereference(
+        &self,
+        #[wasm_bindgen(unchecked_optional_param_type = "Options & RunOptions & Hooks")]
+        options: &JsValue,
+    ) -> Result<JsValue, JsValue> {
+        let given = Given::read(options, "")?;
+        let root = self
+            .documents
+            .root(&self.url)
+            .map_err(|error| failure(&error))?;
+        let mut hooks = JsHooks::new(&given, Some(&self.documents), JsValue::UNDEFINED);
+        dereferenced(
+            &root,
+            Some(&self.documents),
+            &given,
+            &JsValue::UNDEFINED,
+            &mut hooks,
+        )
+    }
+
+    /// Bundles the document that was asked for, as `bundleSchemaFrom` does.
+    ///
+    /// # Errors
+    ///
+    /// Throws for the reasons `bundleSchema` does.
+    pub fn bundle(
+        &self,
+        #[wasm_bindgen(unchecked_optional_param_type = "Options & RunOptions & Hooks")]
+        options: &JsValue,
+    ) -> Result<Ts<Bundled>, JsValue> {
+        let given = Given::read(options, "")?;
+        bundled(&self.documents, &self.url, &given)
+    }
+
+    /// `reference` resolved against the URL of the document asked for.
+    fn absolute(&self, reference: &str) -> Result<String, JsValue> {
+        let (location, fragment) = crate::documents::split(reference);
+        let document = if location.is_empty() {
+            self.url.clone()
+        } else {
+            crate::documents::absolute(Some(&self.url), location)
+                .map_err(|error| failure(&error))?
+        };
+        Ok(format!("{document}#{fragment}"))
+    }
+}
+
+/// Dereferences `root` with what the caller gave, and tells the callbacks
+/// what happened.
+fn dereferenced(
+    root: &Document<'_>,
+    documents: Option<&Documents>,
+    given: &Given,
+    into: &JsValue,
+    hooks: &mut JsHooks<'_>,
+) -> Result<JsValue, JsValue> {
+    let copies = if given.run.clone_references {
+        Copies::Own
+    } else {
+        Copies::Shared
+    };
+    let linked = linked(root, documents, &given.options, into, hooks, copies)?;
+    hooks.after_dereference(&linked)?;
+    Ok(linked)
+}
+
+/// Bundles the document at `url` among `documents` with what the caller
+/// gave.
+fn bundled(documents: &Documents, url: &str, given: &Given) -> Result<Ts<Bundled>, JsValue> {
+    let mut hooks = JsHooks::new(given, Some(documents), JsValue::UNDEFINED);
+    let bundled = documents.bundle_with_hooks(url, &given.options, &mut hooks);
+    let bundled = hooks.finish(bundled)?;
+    hooks.after_bundle(bundled, &JsValue::UNDEFINED)
+}
+
+/// Loads the document at `url` and every document it leads to from
+/// `source`.
+async fn gathered(url: &str, options: &Options, source: &Source) -> Result<Documents, JsValue> {
     let mut documents = Documents::new();
     let mut loaded: usize = 0;
     // What the documents may still take between them.
     let mut bytes_left = options.max_bytes;
-    let root = Documents::normalized(url).map_err(thrown)?;
+    let root = Documents::normalized(url).map_err(|error| failure(&error))?;
     let mut asked = BTreeSet::from([root.clone()]);
     let mut wanted = vec![root.clone()];
     while let Some(next) = wanted.pop() {
         if loaded >= options.max_documents {
-            return Err(thrown(Error::DocumentLimitExceeded {
+            return Err(failure(&Error::DocumentLimitExceeded {
                 limit: options.max_documents,
             }));
         }
@@ -694,7 +1236,7 @@ async fn gathered(
             }
         };
         bytes_left = bytes_left.checked_sub(text.len()).ok_or_else(|| {
-            thrown(Error::SizeLimitExceeded {
+            failure(&Error::SizeLimitExceeded {
                 limit: options.max_bytes,
             })
         })?;
@@ -703,18 +1245,21 @@ async fn gathered(
             Source::Loader { text: true, .. } if is_text(&next) => Value::String(text),
             Source::Loader { .. } => read(&text, options)?,
         };
+        documents
+            .insert(&next, document)
+            .map_err(|error| failure(&error))?;
         // Only what this document refers to is new, so only that is looked
         // at, however many documents came before.
-        for referred in documents.add(&next, document).map_err(thrown)? {
+        for referred in documents
+            .referred(&next, options)
+            .map_err(|error| failure(&error))?
+        {
             if asked.insert(referred.clone()) {
-                wanted.push(referred.clone());
+                wanted.push(referred);
             }
         }
     }
-    let Some(document) = documents.get(&root) else {
-        return Err(thrown(Error::MissingDocument { url: root }));
-    };
-    linked(&document, Some(&documents), options, &JsValue::UNDEFINED)
+    Ok(documents)
 }
 
 /// The names that say a document is plain text.
@@ -733,17 +1278,13 @@ fn is_text(url: &str) -> bool {
     })
 }
 
-/// The options a caller gave, and their member `name`, which is for this
-/// side of the boundary alone.
-fn split_options(options: &JsValue, name: &str) -> Result<(Options, Option<Value>), JsValue> {
-    if options.is_undefined() || options.is_null() {
-        return Ok((Options::default(), None));
-    }
-    let mut members: Map<String, Value> =
-        serde_json::from_str(&json_of(options)?).map_err(thrown)?;
-    let own = members.remove(name);
-    let options = serde_json::from_value(Value::Object(members)).map_err(thrown)?;
-    Ok((options, own))
+/// Whether every place that refers to a target holds the same object.
+#[derive(Clone, Copy)]
+enum Copies {
+    /// They share it.
+    Shared,
+    /// Each has its own copy, except where a copy would hold a cycle.
+    Own,
 }
 
 /// Dereferences `root` and hands the result to JavaScript as shared objects.
@@ -753,15 +1294,18 @@ fn linked(
     documents: Option<&Documents>,
     options: &Options,
     into: &JsValue,
-) -> Result<Ts<Dereferenced>, JsValue> {
+    hooks: &mut JsHooks<'_>,
+    copies: Copies,
+) -> Result<JsValue, JsValue> {
     // The limit is on what the result takes, and shared objects take no more
     // room for being referred to often. The table counts what it writes.
-    let expanded = expand(root, documents, options, Form::Linked).map_err(thrown)?;
-    let table = Table::write(&expanded.schema, options)?;
+    let expanded = expand(root, documents, options, Form::Linked, hooks);
+    let expanded = hooks.finish(expanded)?;
+    let table = Table::write(&expanded.schema, options, copies)?;
     // The links in the schema have been followed, so what they point at can
     // go.
     drop(expanded.anchors);
-    Ok(Ts::new_unchecked(link(&table, into)?))
+    link(&table, into)
 }
 
 /// `dereferenceSchema` for a document held as JSON text. Returns the result
@@ -778,7 +1322,7 @@ pub fn dereference_schema_text(
 ) -> Result<String, JsValue> {
     let options = read_options(options)?;
     let schema = serde_json::from_str(json).map_err(thrown)?;
-    let shared = dereference_schema_shared(&schema, &options).map_err(thrown)?;
+    let shared = dereference_schema_shared(&schema, &options).map_err(|error| failure(&error))?;
     serde_json::to_string(&Written {
         schema: &shared,
         circular: shared.circular(),
@@ -798,19 +1342,268 @@ pub fn schema_stats(schema: &JsValue) -> Result<Ts<Stats>, JsValue> {
     Ok(Ts::new_unchecked(JSON::parse(&stats)?))
 }
 
-/// Reads a document the default loader fetched, which is JSON.
-#[cfg(not(feature = "yaml"))]
-fn read(text: &str, _: &Options) -> Result<Value, JsValue> {
-    serde_json::from_str(text).map_err(thrown)
+/// A step of a path, as JavaScript reads a member.
+fn key_of(step: Step<'_>) -> JsValue {
+    match step {
+        Step::Name(name) => JsValue::from_str(name),
+        Step::Index(position) => JsValue::from_str(&position.to_string()),
+    }
 }
 
-/// Reads a document the default loader fetched, which is JSON or YAML.
-#[cfg(feature = "yaml")]
+/// The value at the end of `path` in `root`, the value holding it, and its
+/// name there.
+fn walk(root: &JsValue, path: &[JsValue]) -> Result<(JsValue, JsValue, JsValue), JsValue> {
+    let mut parent = JsValue::UNDEFINED;
+    let mut key = JsValue::UNDEFINED;
+    let mut value = root.clone();
+    for step in path {
+        if !value.is_object() {
+            return Ok((JsValue::UNDEFINED, parent, key));
+        }
+        let next = Reflect::get(&value, step)?;
+        parent = value;
+        key = step.clone();
+        value = next;
+    }
+    Ok((value, parent, key))
+}
+
+/// What the hooks of a JavaScript run do.
+struct JsHooks<'run> {
+    callbacks: &'run Callbacks,
+    /// The documents of the run, if it has more than the one given.
+    documents: Option<&'run Documents>,
+    /// The caller's own document, where it gave one with no URL.
+    root: JsValue,
+    /// The documents handed to JavaScript so far, by URL.
+    converted: BTreeMap<String, JsValue>,
+    /// When the run has to be done by, as `Date.now` counts, and the limit
+    /// that came from.
+    deadline: Option<(f64, u64)>,
+    continue_on_error: bool,
+    /// What a callback threw, which ends the run.
+    thrown: Option<JsValue>,
+    replaced: Vec<(String, Vec<JsValue>)>,
+    circular: Vec<String>,
+    /// Where each member a bundle looked through is written.
+    looked_through: Vec<(Option<String>, Vec<JsValue>)>,
+    errors: Vec<Unresolved>,
+}
+
+impl<'run> JsHooks<'run> {
+    fn new(given: &'run Given, documents: Option<&'run Documents>, root: JsValue) -> Self {
+        Self {
+            callbacks: &given.callbacks,
+            documents,
+            root,
+            converted: BTreeMap::new(),
+            deadline: given
+                .run
+                .timeout_ms
+                .map(|limit| (Date::now() + f64::from(limit), u64::from(limit))),
+            continue_on_error: given.run.continue_on_error,
+            thrown: None,
+            replaced: Vec::new(),
+            circular: Vec::new(),
+            looked_through: Vec::new(),
+            errors: Vec::new(),
+        }
+    }
+
+    /// The outcome of a run. What a callback threw takes the place of the
+    /// error that stopped the run because of it.
+    fn finish<T>(&mut self, outcome: Result<T, Error>) -> Result<T, JsValue> {
+        if let Some(thrown) = self.thrown.take() {
+            return Err(thrown);
+        }
+        outcome.map_err(|error| failure(&error))
+    }
+
+    /// The document at `url`, or the caller's own, as JavaScript holds it.
+    fn document(&mut self, url: Option<&str>) -> Result<JsValue, JsValue> {
+        let Some(url) = url else {
+            return Ok(self.root.clone());
+        };
+        if let Some(converted) = self.converted.get(url) {
+            return Ok(converted.clone());
+        }
+        let converted = match self.documents.and_then(|documents| documents.document(url)) {
+            Some(document) => JSON::parse(&serde_json::to_string(document).map_err(thrown)?)?,
+            None => JsValue::UNDEFINED,
+        };
+        self.converted.insert(url.to_owned(), converted.clone());
+        Ok(converted)
+    }
+
+    /// The JavaScript value written where `place` is.
+    fn value_of(&mut self, place: &Place<'_, '_>) -> Result<JsValue, JsValue> {
+        let source = place.source();
+        let document = self.document(source.url)?;
+        let path: Vec<JsValue> = source.path.into_iter().map(key_of).collect();
+        Ok(walk(&document, &path)?.0)
+    }
+
+    /// Hands the errors a run carried on past to the caller, and tells the
+    /// callbacks what a dereference did.
+    fn after_dereference(&mut self, linked: &JsValue) -> Result<(), JsValue> {
+        self.errors_onto(linked)?;
+        let schema = Reflect::get(linked, &JsValue::from_str("schema"))?;
+        if let Some(callback) = &self.callbacks.on_dereference {
+            for (reference, path) in &self.replaced {
+                let (value, parent, key) = walk(&schema, path)?;
+                let arguments =
+                    js_sys::Array::of4(&JsValue::from_str(reference), &value, &parent, &key);
+                callback.apply(&JsValue::NULL, &arguments)?;
+            }
+        }
+        if let Some(callback) = &self.callbacks.on_circular {
+            for source in &self.circular {
+                callback.call1(&JsValue::NULL, &JsValue::from_str(source))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Hands a bundle to the caller, written into `into` if that is an
+    /// object, and tells the callbacks what it looked through.
+    fn after_bundle(&mut self, schema: Value, into: &JsValue) -> Result<Ts<Bundled>, JsValue> {
+        if let Some(callback) = self.callbacks.on_bundle.clone() {
+            for (url, path) in core::mem::take(&mut self.looked_through) {
+                let document = self.document(url.as_deref())?;
+                let (value, parent, key) = walk(&document, &path)?;
+                let reference = if value.is_object() {
+                    Reflect::get(&value, &JsValue::from_str("$ref"))?
+                } else {
+                    JsValue::UNDEFINED
+                };
+                let arguments = js_sys::Array::of4(&reference, &value, &parent, &key);
+                callback.apply(&JsValue::NULL, &arguments)?;
+            }
+        }
+        let errors = self
+            .continue_on_error
+            .then(|| core::mem::take(&mut self.errors));
+        let text = serde_json::to_string(&Bundled { schema, errors }).map_err(thrown)?;
+        let bundled = JSON::parse(&text)?;
+        if into.is_object() {
+            let schema = Reflect::get(&bundled, &JsValue::from_str("schema"))?;
+            rewrite(into, &schema)?;
+            Reflect::set(&bundled, &JsValue::from_str("schema"), into)?;
+        }
+        Ok(Ts::new_unchecked(bundled))
+    }
+
+    /// Sets the `errors` member of `result` where the run carried on past
+    /// errors.
+    fn errors_onto(&mut self, result: &JsValue) -> Result<(), JsValue> {
+        if self.continue_on_error {
+            let errors = serde_json::to_string(&self.errors).map_err(thrown)?;
+            Reflect::set(result, &JsValue::from_str("errors"), &JSON::parse(&errors)?)?;
+        }
+        Ok(())
+    }
+}
+
+impl Hooks for JsHooks<'_> {
+    fn excluded(&mut self, place: &Place<'_, '_>) -> Result<bool, Error> {
+        let Some(excluded) = self.callbacks.excluded.clone() else {
+            return Ok(false);
+        };
+        let answer = self.value_of(place).and_then(|value| {
+            excluded.call2(
+                &JsValue::NULL,
+                &JsValue::from_str(&fragment(place.path())),
+                &value,
+            )
+        });
+        match answer {
+            Ok(answer) => Ok(answer.is_truthy()),
+            Err(thrown) => {
+                self.thrown = Some(thrown);
+                Err(Error::Interrupted)
+            }
+        }
+    }
+
+    fn circular(&mut self, place: &Place<'_, '_>) {
+        if self.callbacks.on_circular.is_some() {
+            self.circular.push(place.source().to_string());
+        }
+    }
+
+    fn dereferenced(&mut self, place: &Place<'_, '_>) {
+        if self.callbacks.on_dereference.is_some()
+            && let Some(reference) = reference_of(place.value())
+        {
+            let path = place.path().iter().copied().map(key_of).collect();
+            self.replaced.push((reference.to_owned(), path));
+        }
+    }
+
+    fn bundled(&mut self, place: &Place<'_, '_>) {
+        if self.callbacks.on_bundle.is_some() {
+            let source = place.source();
+            let path = source.path.into_iter().map(key_of).collect();
+            self.looked_through
+                .push((source.url.map(ToOwned::to_owned), path));
+        }
+    }
+
+    fn failed(&mut self, place: &Place<'_, '_>, error: Error) -> Result<(), Error> {
+        if !self.continue_on_error {
+            return Err(error);
+        }
+        self.errors.push(Unresolved {
+            error,
+            source: place.source().to_string(),
+        });
+        Ok(())
+    }
+
+    fn proceed(&mut self) -> Result<(), Error> {
+        match self.deadline {
+            Some((deadline, limit)) if Date::now() > deadline => {
+                Err(Error::TimeLimitExceeded { limit })
+            }
+            Some(_) | None => Ok(()),
+        }
+    }
+
+    fn observes(&self) -> bool {
+        self.callbacks.excluded.is_some()
+            || self.callbacks.on_circular.is_some()
+            || self.callbacks.on_dereference.is_some()
+            || self.callbacks.on_bundle.is_some()
+    }
+}
+
+/// Reads a document the default loader fetched, which is JSON, or YAML in a
+/// build that has it.
 fn read(text: &str, options: &Options) -> Result<Value, JsValue> {
     let json = match serde_json::from_str(text) {
         Ok(document) => return Ok(document),
         Err(error) => error,
     };
+    match yaml(text, options) {
+        Ok(document) => Ok(document),
+        // Text that opens like JSON was meant as JSON, so that reader's
+        // complaint is the one to pass on, as it is in a build without YAML.
+        Err(_) if cfg!(not(feature = "yaml")) || text.trim_start().starts_with(['{', '[']) => {
+            Err(thrown(json))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Reads YAML, which this build cannot.
+#[cfg(not(feature = "yaml"))]
+fn yaml(_: &str, _: &Options) -> Result<Value, JsValue> {
+    Err(JsError::new("this build of unbinder reads no YAML").into())
+}
+
+/// Reads YAML.
+#[cfg(feature = "yaml")]
+fn yaml(text: &str, options: &Options) -> Result<Value, JsValue> {
     // A document has no more values than it has bytes, so the YAML reader's
     // limits follow the text, which is itself limited.
     let limits = serde_saphyr::options! {
@@ -821,13 +1614,7 @@ fn read(text: &str, options: &Options) -> Result<Value, JsValue> {
             max_total_scalar_bytes: text.len(),
         },
     };
-    match serde_saphyr::from_str_with_options(text, limits) {
-        Ok(document) => Ok(document),
-        // Text that opens like JSON was meant as JSON, so that reader's
-        // complaint is the one to pass on.
-        Err(_) if text.trim_start().starts_with(['{', '[']) => Err(thrown(json)),
-        Err(error) => Err(thrown(error)),
-    }
+    serde_saphyr::from_str_with_options(text, limits).map_err(thrown)
 }
 
 /// The result as it is written to JSON text.
@@ -854,9 +1641,22 @@ fn thrown(error: impl core::error::Error) -> JsValue {
     JsError::from(error).into()
 }
 
+/// `error` as a thrown `Error` whose `detail` says which error it is.
+fn failure(error: &Error) -> JsValue {
+    let failure: JsValue = JsError::new(&error.to_string()).into();
+    let detail = match serde_json::to_string(error) {
+        Ok(detail) => JSON::parse(&detail),
+        Err(problem) => return thrown(problem),
+    };
+    match detail.and_then(|detail| Reflect::set(&failure, &JsValue::from_str("detail"), &detail)) {
+        Ok(_) => failure,
+        Err(problem) => problem,
+    }
+}
+
 /// Why the table could not be written.
 enum Failure {
-    /// The result takes more than the limit allows.
+    /// The result takes more than a limit allows.
     Limit(Error),
     Json(serde_json::Error),
 }
@@ -870,18 +1670,10 @@ impl From<serde_json::Error> for Failure {
 impl From<Failure> for JsValue {
     fn from(failure: Failure) -> Self {
         match failure {
-            Failure::Limit(error) => thrown(error),
+            Failure::Limit(error) => crate::wasm::failure(&error),
             Failure::Json(error) => thrown(error),
         }
     }
-}
-
-/// A step from a value to one of its children.
-#[derive(Clone, Copy, Serialize)]
-#[serde(untagged)]
-enum Step<'doc> {
-    Name(&'doc str),
-    Position(usize),
 }
 
 /// A place in an entry that takes the value of another entry: the path to
@@ -916,10 +1708,18 @@ struct Table<'doc, 'options> {
     targets: BTreeMap<*const Anchor<'doc>, Target>,
     /// The targets given a position whose entries are still to be written.
     pending: Vec<(usize, Rc<Anchor<'doc>>)>,
+    copies: Copies,
+    /// The targets a cycle can be reached from, which are shared even where
+    /// each place gets its own copy.
+    cyclic: BTreeSet<*const Anchor<'doc>>,
 }
 
 impl<'doc, 'options> Table<'doc, 'options> {
-    fn write(schema: &SharedSchema<'doc>, options: &'options Options) -> Result<String, Failure> {
+    fn write(
+        schema: &SharedSchema<'doc>,
+        options: &'options Options,
+        copies: Copies,
+    ) -> Result<String, Failure> {
         let mut table = Self {
             options,
             bytes_left: options.max_bytes,
@@ -927,6 +1727,11 @@ impl<'doc, 'options> Table<'doc, 'options> {
             count: 0,
             targets: BTreeMap::new(),
             pending: Vec::new(),
+            copies,
+            cyclic: match copies {
+                Copies::Shared => BTreeSet::new(),
+                Copies::Own => cyclic(schema.shared()),
+            },
         };
         let root = table.reserve();
         table.entry(root, schema.shared())?;
@@ -962,6 +1767,14 @@ impl<'doc, 'options> Table<'doc, 'options> {
         }
     }
 
+    /// Whether `target` is written out at each place that holds it.
+    fn copied(&self, target: &Rc<Anchor<'doc>>) -> bool {
+        match self.copies {
+            Copies::Shared => false,
+            Copies::Own => !self.cyclic.contains(&Rc::as_ptr(target)),
+        }
+    }
+
     /// Gives out the next position.
     fn reserve(&mut self) -> usize {
         let position = self.count;
@@ -977,6 +1790,7 @@ impl<'doc, 'options> Table<'doc, 'options> {
             plain: Vec::new(),
             path: Vec::new(),
             links: Vec::new(),
+            copying: 0,
         };
         entry.value(value)?;
         let Entry { plain, links, .. } = entry;
@@ -1005,6 +1819,95 @@ impl<'doc, 'options> Table<'doc, 'options> {
     }
 }
 
+/// The targets in `root` that lead to a cycle: one they take part in, or one
+/// further in.
+fn cyclic<'doc>(root: &Shared<'doc>) -> BTreeSet<*const Anchor<'doc>> {
+    /// A target being looked through, with the targets it holds.
+    struct Frame<'doc> {
+        target: Rc<Anchor<'doc>>,
+        held: Vec<Rc<Anchor<'doc>>>,
+        next: usize,
+        cyclic: bool,
+    }
+    enum State {
+        Open,
+        Closed { cyclic: bool },
+    }
+    let mut states: BTreeMap<*const Anchor<'doc>, State> = BTreeMap::new();
+    for start in held(root) {
+        if states.contains_key(&Rc::as_ptr(&start)) {
+            continue;
+        }
+        states.insert(Rc::as_ptr(&start), State::Open);
+        let mut frames = vec![Frame {
+            held: held(&start.value),
+            target: start,
+            next: 0,
+            cyclic: false,
+        }];
+        while let Some(frame) = frames.last_mut() {
+            let Some(next) = frame.held.get(frame.next).map(Rc::clone) else {
+                let Some(done) = frames.pop() else {
+                    break;
+                };
+                states.insert(
+                    Rc::as_ptr(&done.target),
+                    State::Closed {
+                        cyclic: done.cyclic,
+                    },
+                );
+                if let Some(parent) = frames.last_mut() {
+                    parent.cyclic |= done.cyclic;
+                }
+                continue;
+            };
+            frame.next = frame.next.saturating_add(1);
+            match states.get(&Rc::as_ptr(&next)) {
+                Some(State::Open) => frame.cyclic = true,
+                Some(State::Closed { cyclic }) => frame.cyclic |= *cyclic,
+                None => {
+                    states.insert(Rc::as_ptr(&next), State::Open);
+                    frames.push(Frame {
+                        held: held(&next.value),
+                        target: next,
+                        next: 0,
+                        cyclic: false,
+                    });
+                }
+            }
+        }
+    }
+    states
+        .into_iter()
+        .filter_map(|(target, state)| match state {
+            State::Closed { cyclic: true } => Some(target),
+            State::Closed { cyclic: false } | State::Open => None,
+        })
+        .collect()
+}
+
+/// The targets `value` holds, without looking inside them.
+fn held<'doc>(value: &Shared<'doc>) -> Vec<Rc<Anchor<'doc>>> {
+    let mut found = Vec::new();
+    let mut pending = vec![value.clone()];
+    while let Some(current) = pending.pop() {
+        match current {
+            Shared::Original(_) => {}
+            Shared::Array(items) => pending.extend(items.iter().cloned()),
+            Shared::Object(members) => {
+                pending.extend(members.iter().map(|(_, member)| member.clone()));
+            }
+            Shared::Inlined(target) => found.push(target),
+            Shared::Merged(merged) => {
+                pending.push(merged.base.clone());
+                pending.extend(merged.overrides.iter().map(|(_, member)| member.clone()));
+            }
+            Shared::Back(back) => found.extend(back.target()),
+        }
+    }
+    found
+}
+
 /// One entry of the table as it is written.
 struct Entry<'table, 'doc, 'options> {
     table: &'table mut Table<'doc, 'options>,
@@ -1013,6 +1916,8 @@ struct Entry<'table, 'doc, 'options> {
     /// The path to the value being written.
     path: Vec<Step<'doc>>,
     links: Vec<Link<'doc>>,
+    /// How many targets are being written out in place, one inside another.
+    copying: usize,
 }
 
 impl<'doc> Entry<'_, 'doc, '_> {
@@ -1038,6 +1943,29 @@ impl<'doc> Entry<'_, 'doc, '_> {
         Ok(())
     }
 
+    /// Writes `target` out in place of linking to it.
+    fn copy(&mut self, target: &Shared<'doc>) -> Result<(), Failure> {
+        if self.copying >= self.table.options.max_depth {
+            return Err(Failure::Limit(Error::DepthLimitExceeded {
+                limit: self.table.options.max_depth,
+            }));
+        }
+        self.copying = self.copying.saturating_add(1);
+        let written = self.value(target);
+        self.copying = self.copying.saturating_sub(1);
+        written
+    }
+
+    /// Writes the place being written as `target`, linked or copied.
+    fn take(&mut self, target: &Rc<Anchor<'doc>>) -> Result<(), Failure> {
+        if self.table.copied(target) {
+            return self.copy(&target.value);
+        }
+        self.link(target, false)?;
+        self.plain.extend(b"null");
+        Ok(())
+    }
+
     fn value(&mut self, value: &Shared<'doc>) -> Result<(), Failure> {
         match value {
             Shared::Original(original) => self.write(original),
@@ -1047,7 +1975,7 @@ impl<'doc> Entry<'_, 'doc, '_> {
                     if position > 0 {
                         self.plain.push(b',');
                     }
-                    self.path.push(Step::Position(position));
+                    self.path.push(Step::Index(position));
                     self.value(item)?;
                     self.path.pop();
                 }
@@ -1063,31 +1991,31 @@ impl<'doc> Entry<'_, 'doc, '_> {
                 self.plain.push(b'}');
                 Ok(())
             }
-            Shared::Inlined(target) => {
-                self.link(target, false)?;
-                self.plain.extend(b"null");
-                Ok(())
-            }
+            Shared::Inlined(target) => self.take(target),
             Shared::Back(back) => match back.target() {
-                Some(target) => {
-                    self.link(&target, false)?;
-                    self.plain.extend(b"null");
-                    Ok(())
-                }
+                Some(target) => self.take(&target),
                 None => self.write(back.written),
             },
             Shared::Merged(merged) => {
                 self.plain.push(b'{');
                 let mut first = true;
-                if let Shared::Inlined(target) = &merged.base {
-                    // The object takes the target's members from the one
-                    // shared object, so only its own are written here.
-                    self.link(target, true)?;
-                    for (name, member) in &merged.overrides {
-                        self.member(&mut first, name, member)?;
+                match &merged.base {
+                    Shared::Inlined(target) if !self.table.copied(target) => {
+                        // The object takes the target's members from the one
+                        // shared object, so only its own are written here.
+                        self.link(target, true)?;
+                        for (name, member) in &merged.overrides {
+                            self.member(&mut first, name, member)?;
+                        }
                     }
-                } else {
-                    value.members(&mut |name, member| self.member(&mut first, name, member))?;
+                    Shared::Original(_)
+                    | Shared::Array(_)
+                    | Shared::Object(_)
+                    | Shared::Inlined(_)
+                    | Shared::Merged(_)
+                    | Shared::Back(_) => {
+                        value.members(&mut |name, member| self.member(&mut first, name, member))?;
+                    }
                 }
                 self.plain.push(b'}');
                 Ok(())

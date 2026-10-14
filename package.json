@@ -9,6 +9,7 @@
     "publish:jsr": "bun run test && cd pkg && jsr publish"
   },
   "devDependencies": {
+    "@apidevtools/json-schema-ref-parser": "16.0.5",
     "@types/node": "^26.6.5",
     "jsr": "^0.14.3",
     "typescript": "^7.0.2"

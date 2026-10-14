@@ -6,6 +6,7 @@ use alloc::rc::Rc;
 #[cfg(feature = "wasm")]
 use alloc::rc::Weak;
 use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
 #[cfg(feature = "wasm")]
 use core::cell::OnceCell;
@@ -17,17 +18,46 @@ use serde_json::{Map, Value};
 
 use crate::documents::{Document, Documents};
 use crate::error::Error;
+use crate::hooks::{Hooks, NoHooks, Place, Sources, Step};
 use crate::references::{CycleId, References, Target};
 #[cfg(feature = "wasm")]
 use crate::shared::Back;
 use crate::shared::{Anchor, Merged, Shared};
 use crate::walk::{REFERENCE_KEY, reference_of};
 
+/// What a reference that cannot be resolved becomes when the run carries on.
+static NULL: Value = Value::Null;
+
+/// How many levels deep `value` nests, and roughly the memory it takes as a
+/// tree, its own place in its parent included.
+pub(crate) fn footprint(value: &Value) -> (usize, usize) {
+    let mut height = 0;
+    let mut bytes: usize = 0;
+    let mut pending = vec![(value, 1_usize)];
+    while let Some((current, level)) = pending.pop() {
+        height = height.max(level);
+        bytes = bytes.saturating_add(VALUE_BYTES);
+        let deeper = level.saturating_add(1);
+        match current {
+            Value::Object(members) => {
+                for (name, member) in members {
+                    bytes = bytes.saturating_add(NAME_BYTES).saturating_add(name.len());
+                    pending.push((member, deeper));
+                }
+            }
+            Value::Array(items) => pending.extend(items.iter().map(|item| (item, deeper))),
+            Value::String(text) => bytes = bytes.saturating_add(text.len()),
+            Value::Null | Value::Bool(_) | Value::Number(_) => {}
+        }
+    }
+    (height, bytes)
+}
+
 /// The memory a value takes inside its parent.
-const VALUE_BYTES: usize = size_of::<Value>();
+pub(crate) const VALUE_BYTES: usize = size_of::<Value>();
 /// The memory an object member takes, not counting its value or the text of
 /// its name.
-const NAME_BYTES: usize = size_of::<String>();
+pub(crate) const NAME_BYTES: usize = size_of::<String>();
 
 /// What to do with a reference that takes part in a cycle.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -85,6 +115,56 @@ pub enum TrueTarget {
     Replace,
 }
 
+/// What to do with a reference to another document.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "wasm",
+    derive(serde::Deserialize, tsify::Tsify),
+    serde(rename_all = "lowercase")
+)]
+pub enum ExternalPolicy {
+    /// Follow it into the document it names. A document dereferenced on its
+    /// own fails with [`Error::ExternalReference`].
+    #[default]
+    Follow,
+    /// Leave it as written.
+    Ignore,
+}
+
+/// Which references within a document are followed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "wasm",
+    derive(serde::Deserialize, tsify::Tsify),
+    serde(rename_all = "lowercase")
+)]
+pub enum LocalPolicy {
+    /// Every one. A fragment that is not a JSON Pointer names the value an
+    /// id gives that name, and an empty reference is the document itself.
+    #[default]
+    Any,
+    /// Only a JSON Pointer. `#name` and an empty `$ref` are left as written,
+    /// as json-schema-ref-parser leaves them, and so is a name in a
+    /// reference to another document.
+    Pointers,
+}
+
+/// How bundling writes a reference that stays within the bundled document.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "wasm",
+    derive(serde::Deserialize, tsify::Tsify),
+    serde(rename_all = "lowercase")
+)]
+pub enum InternalPolicy {
+    /// Point it straight at the value it leads to in the end, past any
+    /// reference on the way.
+    #[default]
+    Direct,
+    /// Leave it as written.
+    Written,
+}
+
 /// How to dereference a document.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(
@@ -111,6 +191,16 @@ pub struct Options {
     /// How many documents the references may lead through. A document can
     /// name any number of others, each of which has to be loaded.
     pub max_documents: usize,
+    /// What to do with a reference to another document.
+    pub external: ExternalPolicy,
+    /// Which references within a document are followed.
+    pub local: LocalPolicy,
+    /// The URL a reference to another document is resolved against, in place
+    /// of the URL of the document it is written in.
+    #[cfg_attr(feature = "wasm", tsify(optional))]
+    pub external_base: Option<String>,
+    /// How bundling writes a reference that stays within the bundle.
+    pub internal: InternalPolicy,
 }
 
 impl Options {
@@ -132,6 +222,10 @@ impl Default for Options {
             max_depth: Self::DEFAULT_MAX_DEPTH,
             max_bytes: Self::DEFAULT_MAX_BYTES,
             max_documents: Self::DEFAULT_MAX_DOCUMENTS,
+            external: ExternalPolicy::default(),
+            local: LocalPolicy::default(),
+            external_base: None,
+            internal: InternalPolicy::default(),
         }
     }
 }
@@ -298,11 +392,26 @@ pub fn dereference_schema_shared<'doc>(
     schema: &'doc Value,
     options: &Options,
 ) -> Result<SharedSchema<'doc>, Error> {
+    dereference_schema_with_hooks(schema, options, &mut NoHooks)
+}
+
+/// [`dereference_schema_shared`], telling `hooks` what it does as it goes
+/// and asking them what to leave as written.
+///
+/// # Errors
+///
+/// Fails for the reasons [`dereference_schema_with`] does, unless
+/// [`Hooks::failed`] lets the run carry on, and when a hook stops it.
+pub fn dereference_schema_with_hooks<'doc, H: Hooks + ?Sized>(
+    schema: &'doc Value,
+    options: &Options,
+    hooks: &mut H,
+) -> Result<SharedSchema<'doc>, Error> {
     let root = Document {
         root: schema,
         url: None,
     };
-    let expanded = expand(&root, None, options, Form::Written)?;
+    let expanded = expand(&root, None, options, Form::Written, hooks)?;
     if expanded.bytes > options.max_bytes {
         return Err(Error::SizeLimitExceeded {
             limit: options.max_bytes,
@@ -314,20 +423,27 @@ pub fn dereference_schema_shared<'doc>(
 /// Expands the document `root` into its shared form, following references
 /// into `documents` if there are any, and measures the memory it would take
 /// written out as a tree.
-pub(crate) fn expand<'doc>(
+pub(crate) fn expand<'doc, H: Hooks + ?Sized>(
     root: &Document<'doc>,
     documents: Option<&'doc Documents>,
     options: &Options,
     form: Form,
+    hooks: &mut H,
 ) -> Result<Expanded<'doc>, Error> {
     let linking = match form {
         #[cfg(feature = "wasm")]
         Form::Linked => options.circular == CircularPolicy::Link,
         Form::Written => false,
     };
+    let references = References::analyze(root, documents, options)?;
+    let sources = Sources::new(references.admitted().to_vec());
     let mut expansion = Expansion {
-        references: References::analyze(root, documents, options)?,
+        references,
+        sources,
         options,
+        observing: hooks.observes(),
+        hooks,
+        path: Vec::new(),
         linking,
         bytes_left: options.max_bytes,
         inlined: BTreeMap::new(),
@@ -343,8 +459,9 @@ pub(crate) fn expand<'doc>(
     // A link stands in for a target until the target is expanded here, on its
     // own, however long the chain of references that led to it.
     #[cfg(feature = "wasm")]
-    while let Some(target) = expansion.queued.pop() {
-        expansion.inline(&target, options.max_depth)?;
+    while let Some((target, path)) = expansion.queued.pop() {
+        expansion.path = path;
+        expansion.inline(&target, options.max_depth, Check::Reached)?;
     }
     Ok(Expanded {
         schema: SharedSchema {
@@ -412,6 +529,16 @@ impl<'doc> Measured<'doc> {
         }
     }
 
+    /// `value` as the document has it, with nothing inside it expanded.
+    fn original(value: &'doc Value) -> Self {
+        let (height, bytes) = footprint(value);
+        Self {
+            shared: Shared::Original(value),
+            height,
+            bytes,
+        }
+    }
+
     /// Whether this is `value` exactly as the document has it.
     fn is(&self, value: &Value) -> bool {
         match &self.shared {
@@ -443,9 +570,23 @@ impl Totals {
     }
 }
 
-struct Expansion<'doc, 'options> {
+/// Whether the hooks have been asked about a target at the place it is
+/// reached.
+#[derive(Clone, Copy)]
+enum Check {
+    Done,
+    Reached,
+}
+
+struct Expansion<'doc, 'run, H: Hooks + ?Sized> {
     references: References<'doc>,
-    options: &'options Options,
+    sources: Sources<'doc>,
+    options: &'run Options,
+    hooks: &'run mut H,
+    /// Whether the hooks are told where things happen, which needs `path`.
+    observing: bool,
+    /// Where in the output the value being expanded goes.
+    path: Vec<Step<'doc>>,
     /// Whether a reference that closes a cycle becomes a link back to the
     /// target, in place of staying as written.
     linking: bool,
@@ -461,13 +602,14 @@ struct Expansion<'doc, 'options> {
     /// it is made.
     #[cfg(feature = "wasm")]
     links: BTreeMap<*const Value, Rc<OnceCell<Weak<Anchor<'doc>>>>>,
-    /// The targets a link points at that are still to be expanded.
+    /// The targets a link points at that are still to be expanded, with the
+    /// place of the first link to each.
     #[cfg(feature = "wasm")]
-    queued: Vec<Rc<Target<'doc>>>,
+    queued: Vec<(Rc<Target<'doc>>, Vec<Step<'doc>>)>,
     circular: BTreeSet<&'doc str>,
 }
 
-impl<'doc> Expansion<'doc, '_> {
+impl<'doc, H: Hooks + ?Sized> Expansion<'doc, '_, H> {
     /// Takes `bytes` out of the budget. Called before the memory is
     /// allocated, so the limit holds for what is requested and not only for
     /// what has been filled.
@@ -487,6 +629,80 @@ impl<'doc> Expansion<'doc, '_> {
         }
     }
 
+    fn enter(&mut self, step: Step<'doc>) {
+        if self.observing {
+            self.path.push(step);
+        }
+    }
+
+    fn leave(&mut self) {
+        if self.observing {
+            self.path.pop();
+        }
+    }
+
+    /// Whether the hooks want `value`, at the place being expanded, left as
+    /// written.
+    fn excluded(&mut self, value: &'doc Value) -> Result<bool, Error> {
+        if !self.observing {
+            return Ok(false);
+        }
+        let place = Place {
+            path: &self.path,
+            value,
+            sources: &self.sources,
+        };
+        self.hooks.excluded(&place)
+    }
+
+    /// Tells the hooks that the reference `node` was replaced.
+    fn tell_dereferenced(&mut self, node: &'doc Value) {
+        if self.observing {
+            let place = Place {
+                path: &self.path,
+                value: node,
+                sources: &self.sources,
+            };
+            self.hooks.dereferenced(&place);
+        }
+    }
+
+    /// Tells the hooks that the reference `node` takes part in a cycle.
+    fn tell_circular(&mut self, node: &'doc Value) {
+        if self.observing {
+            let place = Place {
+                path: &self.path,
+                value: node,
+                sources: &self.sources,
+            };
+            self.hooks.circular(&place);
+        }
+    }
+
+    /// What the reference `node`, which cannot be resolved, becomes if the
+    /// hooks let the run carry on.
+    fn failed(&mut self, node: &'doc Value, error: Error) -> Result<Measured<'doc>, Error> {
+        if !error.is_recoverable() {
+            return Err(error);
+        }
+        let place = Place {
+            path: &self.path,
+            value: node,
+            sources: &self.sources,
+        };
+        self.hooks.failed(&place, error)?;
+        Ok(Measured::scalar(&NULL, 0))
+    }
+
+    /// `node` as written, which has to fit in the depth left.
+    fn kept(&self, node: &'doc Value, depth_left: usize) -> Result<Measured<'doc>, Error> {
+        let kept = Measured::original(node);
+        if kept.height > depth_left {
+            return Err(self.too_deep());
+        }
+        Ok(kept)
+    }
+
     /// Expands `node`, which is in the document `within`. `enclosing` is the
     /// cycle of the innermost target being inlined around it.
     fn value(
@@ -496,6 +712,9 @@ impl<'doc> Expansion<'doc, '_> {
         enclosing: Option<CycleId>,
         depth_left: usize,
     ) -> Result<Measured<'doc>, Error> {
+        if self.excluded(node)? {
+            return self.kept(node, depth_left);
+        }
         let target = match node {
             Value::Object(_) | Value::Array(_) => self.references.at(node),
             Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => None,
@@ -504,7 +723,7 @@ impl<'doc> Expansion<'doc, '_> {
             // A target reached where it stands expands to what a reference
             // to it inlines, so the two share one expansion.
             Some(target) if self.linking || target.cycle() == enclosing => {
-                self.inline(&target, depth_left)
+                self.inline(&target, depth_left, Check::Done)
             }
             Some(_) | None => self.expand(node, within, enclosing, depth_left),
         }
@@ -512,10 +731,13 @@ impl<'doc> Expansion<'doc, '_> {
 
     /// The expansion of `target`, made once and shared by every reference to
     /// it. A target always expands the same way: inside its own cycle.
+    /// A target left as written where the hooks first see it stays so for
+    /// every reference to it.
     fn inline(
         &mut self,
         target: &Target<'doc>,
         depth_left: usize,
+        check: Check,
     ) -> Result<Measured<'doc>, Error> {
         let address = ptr::from_ref(target.value());
         if let Some(done) = self.inlined.get(&address) {
@@ -525,16 +747,25 @@ impl<'doc> Expansion<'doc, '_> {
                 Err(self.too_deep())
             };
         }
-        #[cfg(feature = "wasm")]
-        self.expanding.insert(address);
-        let expanded = self.expand(
-            target.value(),
-            target.document(),
-            target.cycle(),
-            depth_left,
-        );
-        #[cfg(feature = "wasm")]
-        self.expanding.remove(&address);
+        let excluded = match check {
+            Check::Reached => self.excluded(target.value())?,
+            Check::Done => false,
+        };
+        let expanded = if excluded {
+            self.kept(target.value(), depth_left)
+        } else {
+            #[cfg(feature = "wasm")]
+            self.expanding.insert(address);
+            let expanded = self.expand(
+                target.value(),
+                target.document(),
+                target.cycle(),
+                depth_left,
+            );
+            #[cfg(feature = "wasm")]
+            self.expanding.remove(&address);
+            expanded
+        };
         let mut expanded = expanded?;
         expanded.shared = match expanded.shared {
             // A scalar is copied, and a reference to a reference shares the
@@ -572,6 +803,7 @@ impl<'doc> Expansion<'doc, '_> {
         enclosing: Option<CycleId>,
         depth_left: usize,
     ) -> Result<Measured<'doc>, Error> {
+        self.hooks.proceed()?;
         let Some(depth_left) = depth_left.checked_sub(1) else {
             return Err(self.too_deep());
         };
@@ -579,8 +811,9 @@ impl<'doc> Expansion<'doc, '_> {
         // inside it are relative to.
         let scope = self.references.scope(node).cloned();
         let within = scope.as_ref().unwrap_or(within);
+        let followed = reference_of(node).filter(|reference| self.references.follows(reference));
         match node {
-            Value::Object(members) => match reference_of(node) {
+            Value::Object(members) => match followed {
                 Some(reference) => {
                     self.reference(node, members, reference, within, enclosing, depth_left)
                 }
@@ -590,7 +823,10 @@ impl<'doc> Expansion<'doc, '_> {
                 let mut totals = Totals::new();
                 let mut changed: Option<Vec<Shared<'doc>>> = None;
                 for (position, item) in items.iter().enumerate() {
-                    let child = self.value(item, within, enclosing, depth_left)?;
+                    self.enter(Step::Index(position));
+                    let child = self.value(item, within, enclosing, depth_left);
+                    self.leave();
+                    let child = child?;
                     totals.add(&child, 0);
                     if let Some(expanded) = &mut changed {
                         expanded.push(child.shared);
@@ -629,7 +865,10 @@ impl<'doc> Expansion<'doc, '_> {
         let mut totals = Totals::new();
         let mut changed: Option<Vec<(&'doc str, Shared<'doc>)>> = None;
         for (position, (name, member)) in members.iter().enumerate() {
-            let child = self.value(member, within, enclosing, depth_left)?;
+            self.enter(Step::Name(name));
+            let child = self.value(member, within, enclosing, depth_left);
+            self.leave();
+            let child = child?;
             // A string under this name is a reference, and this one would be
             // one that was never written and never resolved.
             if name == REFERENCE_KEY
@@ -675,17 +914,24 @@ impl<'doc> Expansion<'doc, '_> {
         enclosing: Option<CycleId>,
         depth_left: usize,
     ) -> Result<Measured<'doc>, Error> {
-        let target = self.references.target(within, reference)?;
+        let target = match self.references.target(within, reference) {
+            Ok(target) => target,
+            Err(error) => return self.failed(node, error),
+        };
         #[cfg(feature = "wasm")]
         let target = if self.linking {
             if target.cycle().is_some() && target.cycle() == enclosing {
                 self.circular.insert(reference);
+                self.tell_circular(node);
             }
-            let Some(target) = self.settle(target)? else {
+            let target = match self.settle(target) {
+                Ok(Some(target)) => target,
                 // The references lead only to one another, so this one stays.
-                return self.object(node, members, within, enclosing, depth_left);
+                Ok(None) => return self.object(node, members, within, enclosing, depth_left),
+                Err(error) => return self.failed(node, error),
             };
             if members.len() == 1 {
+                self.tell_dereferenced(node);
                 return Ok(self.link(node, &target));
             }
             // Keywords next to the reference merge into its target, which has
@@ -709,6 +955,7 @@ impl<'doc> Expansion<'doc, '_> {
                 }
             };
         if stays {
+            self.tell_circular(node);
             return match self.options.circular {
                 CircularPolicy::Link | CircularPolicy::Expand | CircularPolicy::Ignore => {
                     self.circular.insert(reference);
@@ -719,7 +966,8 @@ impl<'doc> Expansion<'doc, '_> {
                 }),
             };
         }
-        let mut inlined = self.inline(&target, depth_left)?;
+        let mut inlined = self.inline(&target, depth_left, Check::Reached)?;
+        self.tell_dereferenced(node);
         inlined.height = inlined.height.saturating_add(1);
         if members.len() == 1 {
             return Ok(inlined);
@@ -739,7 +987,10 @@ impl<'doc> Expansion<'doc, '_> {
             if name == REFERENCE_KEY {
                 continue;
             }
-            let sibling = self.value(member, within, enclosing, depth_left)?;
+            self.enter(Step::Name(name));
+            let sibling = self.value(member, within, enclosing, depth_left);
+            self.leave();
+            let sibling = sibling?;
             inlined.height = inlined.height.max(sibling.height.saturating_add(1));
             inlined.bytes = inlined
                 .bytes
@@ -763,6 +1014,7 @@ impl<'doc> Expansion<'doc, '_> {
     fn settle(&mut self, mut target: Rc<Target<'doc>>) -> Result<Option<Rc<Target<'doc>>>, Error> {
         let mut passed = BTreeSet::new();
         while let Some(next) = reference_of(target.value())
+            && self.references.follows(next)
             && target
                 .value()
                 .as_object()
@@ -789,7 +1041,12 @@ impl<'doc> Expansion<'doc, '_> {
         match target.value() {
             Value::Object(_) | Value::Array(_) => {
                 if !self.links.contains_key(&address) && !self.inlined.contains_key(&address) {
-                    self.queued.push(Rc::clone(target));
+                    let path = if self.observing {
+                        self.path.clone()
+                    } else {
+                        Vec::new()
+                    };
+                    self.queued.push((Rc::clone(target), path));
                 }
                 Measured {
                     shared: Shared::Back(Back {
@@ -819,7 +1076,7 @@ impl<'doc> Expansion<'doc, '_> {
             return Ok(Shared::Original(back.written));
         }
         match self.references.at(back.target) {
-            Some(target) => Ok(self.inline(&target, depth_left)?.shared),
+            Some(target) => Ok(self.inline(&target, depth_left, Check::Done)?.shared),
             None => Ok(Shared::Original(back.written)),
         }
     }

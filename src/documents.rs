@@ -12,8 +12,14 @@ use alloc::vec::Vec;
 use fluent_uri::{Iri, IriRef};
 use serde_json::{Map, Value};
 
+use crate::bundle::bundle;
 use crate::dereference::{Form, Options, SharedSchema, expand};
-use crate::error::Error;
+use crate::error::{Error, PointerError};
+use crate::hooks::{Hooks, NoHooks};
+use crate::pointer;
+#[cfg(feature = "wasm")]
+use crate::references::Policy;
+use crate::references::References;
 use crate::walk::REFERENCE_KEY;
 
 /// A document, or a part of one that an id makes a resource of its own.
@@ -307,17 +313,200 @@ impl Documents {
     ///
     /// [`dereference_schema_shared`]: crate::dereference_schema_shared
     pub fn dereference(&self, url: &str, options: &Options) -> Result<SharedSchema<'_>, Error> {
-        let url = absolute(None, url)?;
-        let Some(root) = self.get(&url) else {
-            return Err(Error::MissingDocument { url });
-        };
-        let expanded = expand(&root, Some(self), options, Form::Written)?;
+        self.dereference_with_hooks(url, options, &mut NoHooks)
+    }
+
+    /// [`Documents::dereference`], telling `hooks` what it does as it goes
+    /// and asking them what to leave as written.
+    ///
+    /// # Errors
+    ///
+    /// Fails for the reasons [`Documents::dereference`] does, unless
+    /// [`Hooks::failed`] lets the run carry on, and when a hook stops it.
+    pub fn dereference_with_hooks<H: Hooks + ?Sized>(
+        &self,
+        url: &str,
+        options: &Options,
+        hooks: &mut H,
+    ) -> Result<SharedSchema<'_>, Error> {
+        let root = self.root(url)?;
+        let expanded = expand(&root, Some(self), options, Form::Written, hooks)?;
         if expanded.bytes > options.max_bytes {
             return Err(Error::SizeLimitExceeded {
                 limit: options.max_bytes,
             });
         }
         Ok(expanded.schema)
+    }
+
+    /// Bundles the document at `url`: each value of another document that a
+    /// reference leads to is written into it once, at the first place that
+    /// refers to it, and every other reference to that value points there.
+    /// The result refers to no other document, and its references are not
+    /// inlined. References within it are pointed straight at what they lead
+    /// to, unless [`Options::internal`] says otherwise.
+    ///
+    /// The places are chosen as json-schema-ref-parser chooses them.
+    ///
+    /// ```
+    /// use serde_json::json;
+    /// use unbinder::{Documents, Options};
+    ///
+    /// let mut documents = Documents::new();
+    /// documents.insert(
+    ///     "https://example.com/order.json",
+    ///     json!({
+    ///         "billing": { "$ref": "address.json" },
+    ///         "shipping": { "$ref": "address.json" }
+    ///     }),
+    /// )?;
+    /// documents.insert("https://example.com/address.json", json!({ "type": "object" }))?;
+    ///
+    /// assert_eq!(
+    ///     documents.bundle("https://example.com/order.json", &Options::default())?,
+    ///     json!({
+    ///         "billing": { "type": "object" },
+    ///         "shipping": { "$ref": "#/billing" }
+    ///     })
+    /// );
+    /// # Ok::<(), unbinder::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Fails when `url` or a document it leads to is not in the set, when a
+    /// reference does not resolve, and when the bundle nests deeper than
+    /// [`Options::max_depth`] or takes more than [`Options::max_bytes`].
+    pub fn bundle(&self, url: &str, options: &Options) -> Result<Value, Error> {
+        self.bundle_with_hooks(url, options, &mut NoHooks)
+    }
+
+    /// [`Documents::bundle`], telling `hooks` what it does as it goes and
+    /// asking them what to leave as written.
+    ///
+    /// # Errors
+    ///
+    /// Fails for the reasons [`Documents::bundle`] does, unless
+    /// [`Hooks::failed`] lets the run carry on, and when a hook stops it.
+    pub fn bundle_with_hooks<H: Hooks + ?Sized>(
+        &self,
+        url: &str,
+        options: &Options,
+        hooks: &mut H,
+    ) -> Result<Value, Error> {
+        bundle(&self.root(url)?, Some(self), options, hooks)
+    }
+
+    /// The URLs of the documents in the set, sorted.
+    #[must_use]
+    pub fn urls(&self) -> Vec<&str> {
+        self.entries.keys().map(String::as_str).collect()
+    }
+
+    /// The document at `url`, if it is in the set.
+    #[must_use]
+    pub fn document(&self, url: &str) -> Option<&Value> {
+        match absolute(None, url) {
+            Ok(url) => self.entries.get(&url).map(|entry| &entry.document),
+            // Nothing is in the set under what is not a URL.
+            Err(_) => None,
+        }
+    }
+
+    /// The value `reference` points at: an absolute URL of a document in
+    /// the set, with a JSON Pointer or a name an id gives in its fragment.
+    /// A pointer passes through any reference on its way, and a bare
+    /// reference where it ends is followed to what it leads to.
+    ///
+    /// ```
+    /// use serde_json::json;
+    /// use unbinder::{Documents, Options};
+    ///
+    /// let mut documents = Documents::new();
+    /// documents.insert(
+    ///     "https://example.com/order.json",
+    ///     json!({ "customer": { "$ref": "customer.json" } }),
+    /// )?;
+    /// documents.insert(
+    ///     "https://example.com/customer.json",
+    ///     json!({ "properties": { "name": { "type": "string" } } }),
+    /// )?;
+    ///
+    /// assert_eq!(
+    ///     documents.lookup(
+    ///         "https://example.com/order.json#/customer/properties/name",
+    ///         &Options::default()
+    ///     )?,
+    ///     json!({ "type": "string" })
+    /// );
+    /// # Ok::<(), unbinder::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Fails when the document is not in the set and when the pointer does
+    /// not resolve.
+    pub fn lookup(&self, reference: &str, options: &Options) -> Result<Value, Error> {
+        let (location, fragment) = split(reference);
+        let root = self.root(location)?;
+        let local = format!("#{fragment}");
+        let mut references = References::analyze(&root, Some(self), options)?;
+        let target = references.target(&root, &local)?;
+        let (target, _, _) = references.settle(target)?;
+        Ok(target.value().clone())
+    }
+
+    /// Puts `value` where `reference` points: an absolute URL of a document
+    /// in the set, with a JSON Pointer in its fragment. Members missing on
+    /// the way are added as empty objects, and `-` as the last token of a
+    /// pointer into an array adds an item at its end.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the document is not in the set, when the pointer cannot
+    /// be read or passes through a value that is neither an object nor an
+    /// array, and when the document then refers to something that is not a
+    /// URL. The document is unchanged when it fails.
+    pub fn set(&mut self, reference: &str, value: Value) -> Result<(), Error> {
+        let (location, fragment) = split(reference);
+        let url = absolute(None, location)?;
+        let unresolved = |cause| Error::UnresolvedReference {
+            reference: reference.to_owned(),
+            cause,
+        };
+        let tokens = pointer::tokens(fragment).map_err(unresolved)?;
+        let Some(entry) = self.entries.get(&url) else {
+            return Err(Error::MissingDocument { url });
+        };
+        let mut document = entry.document.clone();
+        place(&mut document, &tokens, value).map_err(unresolved)?;
+        self.add(&url, document).map(|_| ())
+    }
+
+    /// The absolute URLs of the documents the document at `url` refers to,
+    /// under the policies in `options`.
+    #[cfg(feature = "wasm")]
+    pub(crate) fn referred(&self, url: &str, options: &Options) -> Result<Vec<String>, Error> {
+        let Some(document) = self.get(url) else {
+            return Ok(Vec::new());
+        };
+        let policy = Policy::of(options);
+        let mut referred = Vec::new();
+        for (reference, within) in survey(&document).references {
+            let (location, _) = split(reference);
+            if location.is_empty() || !policy.follows(reference) {
+                continue;
+            }
+            let base = options.external_base.as_deref().or(within.url.as_deref());
+            referred.push(absolute(base, location)?);
+        }
+        Ok(referred)
+    }
+
+    /// The document at `url`, which has to be in the set.
+    pub(crate) fn root(&self, url: &str) -> Result<Document<'_>, Error> {
+        let url = absolute(None, url)?;
+        self.get(&url).ok_or(Error::MissingDocument { url })
     }
 
     /// The document known by the absolute URL `url`.
@@ -339,5 +528,75 @@ impl Documents {
             root: &entry.document,
             url: Some(known.as_str().into()),
         })
+    }
+}
+
+/// Puts `value` at the end of `tokens` in `document`, adding an empty object
+/// for each member missing on the way.
+fn place(document: &mut Value, tokens: &[String], value: Value) -> Result<(), PointerError> {
+    let Some((last, leading)) = tokens.split_last() else {
+        *document = value;
+        return Ok(());
+    };
+    let mut current = document;
+    for token in leading {
+        current = match current {
+            Value::Object(members) => members
+                .entry(token.clone())
+                .or_insert_with(|| Value::Object(Map::new())),
+            Value::Array(items) => {
+                let index = array_index(token, items.len())?;
+                if index == items.len() {
+                    items.push(Value::Object(Map::new()));
+                }
+                let length = items.len();
+                items
+                    .get_mut(index)
+                    .ok_or(PointerError::IndexOutOfBounds { index, length })?
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
+                return Err(PointerError::NotAContainer {
+                    token: token.clone(),
+                });
+            }
+        };
+    }
+    match current {
+        Value::Object(members) => {
+            members.insert(last.clone(), value);
+            Ok(())
+        }
+        Value::Array(items) => {
+            let index = array_index(last, items.len())?;
+            match items.get_mut(index) {
+                Some(item) => *item = value,
+                None => items.push(value),
+            }
+            Ok(())
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
+            Err(PointerError::NotAContainer {
+                token: last.clone(),
+            })
+        }
+    }
+}
+
+/// The position `token` names in an array of `length` items: one that is
+/// there, or `-` or `length` for one added at the end.
+fn array_index(token: &str, length: usize) -> Result<usize, PointerError> {
+    if token == "-" {
+        return Ok(length);
+    }
+    let invalid = || PointerError::InvalidIndex {
+        token: token.to_owned(),
+    };
+    if token != "0" && token.starts_with(['0', '+']) {
+        return Err(invalid());
+    }
+    match token.parse::<usize>() {
+        Ok(index) if index <= length => Ok(index),
+        Ok(index) => Err(PointerError::IndexOutOfBounds { index, length }),
+        Err(_) => Err(invalid()),
     }
 }

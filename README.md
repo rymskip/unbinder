@@ -288,6 +288,10 @@ fn main() -> Result<(), Error> {
 | `max_depth` | 128      | How deep the output may nest                                |
 | `max_bytes` | 256 MiB  | Roughly how much memory the output may take as a tree       |
 | `max_documents` | 1024 | How many documents the references may lead through          |
+| `external`  | `Follow` | `Follow` a reference to another document, or `Ignore` it and leave it as written |
+| `local`     | `Any`    | Follow `Any` reference within a document, or only JSON `Pointers`, leaving `#name` and an empty `$ref` as written |
+| `external_base` | none | Resolve references to other documents against this URL instead of the document they are in |
+| `internal`  | `Direct` | When bundling, point a reference within the bundle `Direct`ly at its final target, or leave it as `Written` |
 
 `Link` joins a cycle into the result where the result is JavaScript objects,
 and is the same as `Expand` for a tree or text.
@@ -302,6 +306,35 @@ document that describes more than `max_bytes` is refused before any of it is
 written. Exceeding a limit returns `Error::DepthLimitExceeded` or
 `Error::SizeLimitExceeded`. Dereferencing recurses once per level of depth, so
 raise `max_depth` only as far as the stack allows.
+
+### Hooks
+
+`dereference_schema_with_hooks`, `Documents::dereference_with_hooks` and the
+bundling functions take a `Hooks` implementation. Each method has a default
+that changes nothing:
+
+| Method         | Called                                              |
+| -------------- | --------------------------------------------------- |
+| `excluded`     | For every value reached; `true` leaves it, and everything inside it, as written |
+| `circular`     | With each reference that takes part in a cycle      |
+| `dereferenced` | With each reference that was replaced, and where    |
+| `bundled`      | With each member a bundle looks through that has a `$ref` |
+| `failed`       | With a reference that does not resolve; `Ok` carries on with `null` in its place |
+| `proceed`      | Before each value, so a run can be stopped, say on a time limit |
+
+Each is given a `Place`: its path in the output, the value as written, and
+`source()`, where the value is written.
+
+### Bundling
+
+`bundle_schema` and `Documents::bundle` produce one document whose references
+all point within it, without inlining them. Each value of another document
+that a reference leads to is written once, at the place json-schema-ref-parser
+would choose, and every other reference to it, or into it, points there.
+References within the document are pointed straight at what they lead to.
+
+`Documents::lookup` reads the value a URL with a JSON Pointer points at,
+passing through references on the way, and `Documents::set` writes one.
 
 ### JavaScript/TypeScript
 
@@ -331,7 +364,8 @@ document and changing a target in one place changes it in all of them. The
 schema passed in is left untouched. `dereferenceSchemaText` returns JSON text
 in which every reference has its own copy.
 
-Options are a plain object, and failures are thrown as `Error`:
+Options are a plain object, and failures are thrown as `Error`, with the
+kind of failure in `error.detail`:
 
 ```typescript
 import init, { dereferenceSchema, type Options } from "unbinder";
@@ -372,10 +406,20 @@ The same, with [options](#options) in place of the defaults.
 The same result [without copying](#without-copying). `SharedSchema` implements
 `Serialize`, and `to_value` builds the tree from it.
 
+#### `dereference_schema_with_hooks(schema, options, hooks) -> Result<SharedSchema, Error>`
+
+The shared result, with [hooks](#hooks).
+
+#### `bundle_schema(schema: &Value, options: &Options) -> Result<Value, Error>`
+
+[Bundles](#bundling) one document. `bundle_schema_with_hooks` takes hooks.
+
 #### `Documents`
 
 A set of documents that refer to one another: `insert(url, document)`,
-`missing()` for the URLs still to load, and `dereference(url, options)`. See
+`missing()` for the URLs still to load, `dereference(url, options)`,
+`bundle(url, options)`, `lookup(reference, options)`, `set(reference, value)`,
+`urls()` and `document(url)`. The `_with_hooks` forms take hooks. See
 [references to other documents](#references-to-other-documents).
 
 #### `Stats::of(schema: &Value) -> Stats`
@@ -411,20 +455,139 @@ interface LoadOptions {
     files?: "none" | "folder" | "any";
     folder?: string;
     text?: boolean;
+    headers?: Record<string, string>;
+    timeoutMs?: number;
+    redirects?: number;
+    credentials?: "same-origin" | "include" | "omit";
 }
+
+interface RunOptions {
+    timeoutMs?: number;
+    continueOnError?: boolean;
+    cloneReferences?: boolean;
+}
+
+interface Hooks {
+    excluded?: (path: string, value: unknown) => boolean;
+    onCircular?: (source: string) => void;
+    onDereference?: (reference: string, value: unknown, parent: unknown, key: string | undefined) => void;
+    onBundle?: (reference: unknown, value: unknown, parent: unknown, key: string | undefined) => void;
+}
+
+interface Unresolved {
+    error: Error; // the failure, by `kind`
+    source: string;
+}
+
+interface Bundled {
+    schema: unknown;
+    errors?: Unresolved[];
+}
+
+type Given = Options & RunOptions & Hooks;
 
 function dereferenceSchema(
     schema: any,
-    options?: Options & { mutateInputSchema?: boolean },
-): Dereferenced;
+    options?: Given & { mutateInputSchema?: boolean },
+): Dereferenced & { errors?: Unresolved[] };
 function dereferenceSchemaFrom(
+    url: string,
+    options?: Given & { load?: LoadOptions },
+    resolve?: (url: string) => unknown,
+): Promise<Dereferenced & { errors?: Unresolved[] }>;
+function bundleSchema(schema: any, options?: Given & { mutateInputSchema?: boolean }): Bundled;
+function bundleSchemaFrom(
+    url: string,
+    options?: Given & { load?: LoadOptions },
+    resolve?: (url: string) => unknown,
+): Promise<Bundled>;
+function resolveSchemaFrom(
     url: string,
     options?: Options & { load?: LoadOptions },
     resolve?: (url: string) => unknown,
-): Promise<Dereferenced>;
+): Promise<Resolved>;
 function dereferenceSchemaText(json: string, options?: Options): string;
 function schemaStats(schema: any): Stats;
+
+class Resolved {
+    readonly url: string;
+    urls(): string[];
+    get(reference: string): unknown;
+    exists(reference: string): boolean;
+    set(reference: string, value: unknown): void;
+    toJSON(): Record<string, unknown>;
+    dereference(options?: Given): Dereferenced & { errors?: Unresolved[] };
+    bundle(options?: Given): Bundled;
+}
 ```
+
+Every function that dereferences or bundles also takes these members in its
+options, besides `Options`:
+
+| Member            | Meaning                                                  |
+| ----------------- | -------------------------------------------------------- |
+| `excluded(path, value)` | Return `true` to leave the value at `path`, and everything inside it, as written |
+| `onDereference(reference, value, parent, key)` | Called with each reference replaced and what replaced it |
+| `onCircular(source)` | Called with where each reference in a cycle is written |
+| `onBundle(reference, value, parent, key)` | Called with each member a bundle looked through that has a `$ref` |
+| `continueOnError` | Put `null` where a reference does not resolve, carry on, and list each failure in `errors` |
+| `timeoutMs`       | Throw once the run has taken this long                    |
+| `cloneReferences` | Give each place its own copy of its target, except where the copy would hold a cycle |
+
+```javascript
+import init, { bundleSchemaFrom, resolveSchemaFrom } from "unbinder";
+
+await init();
+
+// One document with every reference pointing within it.
+const { schema } = await bundleSchemaFrom("schemas/order.json", {
+    load: { files: "any" },
+});
+
+// The documents as loaded, to read and change before dereferencing.
+const resolved = await resolveSchemaFrom("schemas/order.json", {
+    load: { files: "any" },
+});
+resolved.get("#/properties/customer");
+resolved.set("customer.json#/required", ["id"]);
+const { schema: dereferenced } = resolved.dereference({ cloneReferences: true });
+```
+
+The built-in loader also takes `headers` for every request, `timeoutMs` per
+request (a minute by default), `redirects` (5 by default) and
+`credentials`, in `load`. Both apply only to requests to the origin of the URL
+you gave, so a document cannot send a secret elsewhere by naming another
+origin or redirecting to one. A `resolve` function decides for itself what
+each request sends.
+
+### What json-schema-ref-parser does, and how to get it here
+
+| json-schema-ref-parser                 | unbinder                                         |
+| -------------------------------------- | ------------------------------------------------ |
+| `dereference`                          | `dereferenceSchema`, `dereferenceSchemaFrom`     |
+| `bundle`                               | `bundleSchema`, `bundleSchemaFrom`               |
+| `resolve`, `$refs.get/exists/set/paths/values` | `resolveSchemaFrom`, then `get`, `exists`, `set`, `urls`, `toJSON` |
+| `parse`                                | `resolveSchemaFrom` with `external: "ignore"`, then `get("#")` |
+| `dereference.circular: true / false / "ignore"` | `circular: "link"` / `"reject"` / `"ignore"` |
+| `dereference.mergeKeys: false`         | `siblings: "shallow"`                            |
+| `dereference.excludedPathMatcher`, `bundle.excludedPathMatcher`, `resolveExcludedPathMatcher` | `excluded` |
+| `dereference.onCircular`, `onDereference`, `bundle.onBundle` | `onCircular`, `onDereference`, `onBundle` |
+| `dereference.cloneReferences`          | `cloneReferences`                                |
+| `dereference.externalReferenceResolution: "root"` | `externalBase` set to the working directory |
+| `dereference.maxDepth`                 | `maxDepth`                                       |
+| `dereference.preservedProperties`      | Always: every keyword next to a `$ref` is kept   |
+| `bundle.optimizeInternalRefs: false`   | `internal: "written"`                            |
+| `resolve.external: false`              | `external: "ignore"`                             |
+| `resolve.http` `headers`, `timeout`, `redirects`, `withCredentials`, `safeUrlResolver` | `load` `headers`, `timeoutMs`, `redirects`, `credentials: "include"`, `safeUrlResolver` |
+| `resolve.http.maxContentLength`        | `maxBytes`, for all documents together           |
+| `resolve.file`, files by default       | `load: { files: "any" }`                          |
+| Text files as strings                  | `load: { text: true }`                           |
+| A custom resolver or parser            | The `resolve` function, which returns the parsed document |
+| `continueOnError`                      | `continueOnError`, with the failures in `errors`  |
+| `timeoutMs`                            | `timeoutMs`                                      |
+| `mutateInputSchema`                    | `mutateInputSchema`                              |
+| `#name` and empty `$ref` left alone    | `local: "pointers"`                              |
+| A reference to `true` with keywords becomes `true` | `trueTarget: "replace"`              |
 
 Documents cross the WebAssembly boundary as JSON, so a schema must be plain
 JSON data and may nest at most 128 levels deep. For `dereferenceSchemaText`,
@@ -496,7 +659,17 @@ Run it with `pixi run bench`.
     returns that object. The objects inside it are new ones, and a value JSON
     cannot hold is not carried over.
 -   Every object with a string `$ref` member is treated as a reference,
-    including one inside `enum`, `const`, `default` or `examples`.
+    including one inside `enum`, `const`, `default` or `examples`, unless
+    `excluded` leaves it out.
+-   A reference that does not resolve fails only where it is reached, so one
+    in a part of another document that nothing inlines is not reported.
+-   `Resolved.get` returns a copy, so changing it changes nothing loaded;
+    `set` does that.
+-   A binary file is not read as bytes: json-schema-ref-parser inlines a
+    `Buffer` for an image, which JSON cannot hold.
+-   A target that is an array with keywords next to its `$ref` stays an array
+    when dereferenced. json-schema-ref-parser turns it into an object keyed by
+    position.
 -   A reference written under the name `$ref` that points at a string is an
     error. Inlining it would leave a `$ref` that nothing resolved.
 -   `$anchor` and `$dynamicRef` are not interpreted.

@@ -20,7 +20,7 @@ use core::ptr;
 
 use serde_json::Value;
 
-use crate::dereference::Options;
+use crate::dereference::{ExternalPolicy, LocalPolicy, Options};
 use crate::documents::{Document, Documents, absolute, split, survey};
 use crate::error::{Error, PointerError};
 use crate::pointer::{self, Slashed};
@@ -103,6 +103,39 @@ impl Walk<'_> {
     }
 }
 
+/// Which references are followed.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Policy {
+    external: ExternalPolicy,
+    local: LocalPolicy,
+}
+
+impl Policy {
+    pub(crate) const fn of(options: &Options) -> Self {
+        Self {
+            external: options.external,
+            local: options.local,
+        }
+    }
+
+    pub(crate) fn follows(self, reference: &str) -> bool {
+        match reference.strip_prefix('#') {
+            Some(fragment) => match self.local {
+                LocalPolicy::Any => true,
+                LocalPolicy::Pointers => {
+                    fragment.is_empty()
+                        || fragment.starts_with('/')
+                        || fragment
+                            .get(..3)
+                            .is_some_and(|slash| slash.eq_ignore_ascii_case("%2f"))
+                }
+            },
+            None if reference.is_empty() => matches!(self.local, LocalPolicy::Any),
+            None => matches!(self.external, ExternalPolicy::Follow),
+        }
+    }
+}
+
 /// The targets each target leads to, keyed by where the target sits in its
 /// document.
 type Successors<'doc> = BTreeMap<*const Value, Vec<Rc<Target<'doc>>>>;
@@ -145,14 +178,18 @@ pub(crate) struct References<'doc> {
     /// The names that hold a `/`, for each object a pointer looked for one
     /// in.
     slashed: BTreeMap<*const Value, Slashed<'doc>>,
-    /// The roots of the documents looked through so far.
-    admitted: Vec<&'doc Value>,
+    /// The documents looked through so far.
+    admitted: Vec<Document<'doc>>,
     /// References found in an admitted document and not yet resolved.
     unresolved: Vec<(&'doc str, Document<'doc>)>,
     cycles: usize,
     /// How many references a pointer may pass through between two tokens.
     max_hops: usize,
     max_documents: usize,
+    policy: Policy,
+    /// What a reference to another document is resolved against, if not the
+    /// document it is written in.
+    external_base: Option<String>,
 }
 
 impl<'doc> References<'doc> {
@@ -176,14 +213,22 @@ impl<'doc> References<'doc> {
             cycles: 0,
             max_hops: options.max_depth,
             max_documents: options.max_documents,
+            policy: Policy::of(options),
+            external_base: options.external_base.clone(),
         };
         references.admit(root)?;
         while let Some((reference, within)) = references.unresolved.pop() {
-            references.target(&within, reference)?;
+            // A reference that fails on its own fails again where it is
+            // reached, which a part left as written never is.
+            if let Err(error) = references.target(&within, reference)
+                && !error.is_recoverable()
+            {
+                return Err(error);
+            }
         }
         let mut successors = Successors::new();
-        for admitted in references.admitted.clone() {
-            references.successors(admitted, &mut successors);
+        for admitted in &references.admitted {
+            references.successors(admitted.root, &mut successors);
         }
         let starts: Vec<_> = references.by_address.values().map(Rc::clone).collect();
         for start in starts {
@@ -198,7 +243,7 @@ impl<'doc> References<'doc> {
         if self
             .admitted
             .iter()
-            .any(|admitted| ptr::eq(*admitted, document.root))
+            .any(|admitted| ptr::eq(admitted.root, document.root))
         {
             return Ok(());
         }
@@ -207,7 +252,7 @@ impl<'doc> References<'doc> {
                 limit: self.max_documents,
             });
         }
-        self.admitted.push(document.root);
+        self.admitted.push(document.clone());
         let surveyed = survey(document);
         for resource in surveyed.resources {
             self.scopes
@@ -217,8 +262,51 @@ impl<'doc> References<'doc> {
             }
         }
         self.names.extend(surveyed.names);
-        self.unresolved.extend(surveyed.references);
+        let policy = self.policy;
+        self.unresolved.extend(
+            surveyed
+                .references
+                .into_iter()
+                .filter(|(reference, _)| policy.follows(reference)),
+        );
         Ok(())
+    }
+
+    /// The documents looked through.
+    pub(crate) fn admitted(&self) -> &[Document<'doc>] {
+        &self.admitted
+    }
+
+    /// Whether `reference` is followed, or left as written.
+    pub(crate) fn follows(&self, reference: &str) -> bool {
+        self.policy.follows(reference)
+    }
+
+    /// What a reference to `target` leads to in the end, past any bare
+    /// reference; how many it passed; and whether they lead back to one
+    /// another, in which case the last one reached is what it leads to.
+    pub(crate) fn settle(
+        &mut self,
+        mut target: Rc<Target<'doc>>,
+    ) -> Result<(Rc<Target<'doc>>, usize, bool), Error> {
+        let mut passed = BTreeSet::new();
+        loop {
+            let value = target.value();
+            let bare = value.as_object().is_some_and(|members| members.len() == 1);
+            let Some(next) = reference_of(value).filter(|next| bare && self.follows(next)) else {
+                return Ok((target, passed.len(), false));
+            };
+            if !passed.insert(ptr::from_ref(value)) {
+                return Ok((target, passed.len(), true));
+            }
+            if passed.len() > self.max_hops {
+                return Err(Error::DepthLimitExceeded {
+                    limit: self.max_hops,
+                });
+            }
+            let document = target.document().clone();
+            target = self.target(&document, next)?;
+        }
     }
 
     /// The target that `value` is, if any reference points at it.
@@ -286,7 +374,7 @@ impl<'doc> References<'doc> {
             // any other.
             let through = match found {
                 Some(_) => None,
-                None => reference_of(walk.current),
+                None => reference_of(walk.current).filter(|through| self.policy.follows(through)),
             };
             let Some(through) = through else {
                 let (next, count) = match found {
@@ -336,7 +424,8 @@ impl<'doc> References<'doc> {
         let external = || Error::ExternalReference {
             reference: reference.to_owned(),
         };
-        let url = match absolute(within.url.as_deref(), location) {
+        let base = self.external_base.as_deref().or(within.url.as_deref());
+        let url = match absolute(base, location) {
             Ok(url) => url,
             // With no other documents to go by, a relative URL is simply a
             // reference out of this one.
@@ -381,7 +470,11 @@ impl<'doc> References<'doc> {
         };
         // A fragment that is not a pointer may be a name an id gave a value.
         let named = match &resource.url {
-            Some(url) if !fragment.is_empty() && !fragment.starts_with('/') => {
+            Some(url)
+                if matches!(self.policy.local, LocalPolicy::Any)
+                    && !fragment.is_empty()
+                    && !fragment.starts_with('/') =>
+            {
                 self.names.get(&format!("{url}#{fragment}")).copied()
             }
             Some(_) | None => None,

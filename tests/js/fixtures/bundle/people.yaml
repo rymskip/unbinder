@@ -1,0 +1,10 @@
+Person:
+  type: object
+  description: Someone
+  properties:
+    name:
+      type: string
+    pets:
+      type: array
+      items:
+        $ref: 'pet.json'

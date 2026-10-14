@@ -1,0 +1,14 @@
+{
+  "title": "Root",
+  "definitions": {
+    "pet": { "$ref": "pet.json" }
+  },
+  "properties": {
+    "owner": { "$ref": "people.yaml#/Person" },
+    "pet": { "$ref": "pet.json" },
+    "petName": { "$ref": "pet.json#/properties/name" },
+    "friend": { "$ref": "people.yaml#/Person", "description": "A friend" },
+    "local": { "$ref": "#/definitions/pet" },
+    "examples": { "default": { "$ref": "pet.json" } }
+  }
+}

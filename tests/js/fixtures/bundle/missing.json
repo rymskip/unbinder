@@ -1,0 +1,5 @@
+{
+  "found": { "$ref": "pet.json#/properties/name" },
+  "lost": { "$ref": "pet.json#/properties/nowhere" },
+  "gone": { "$ref": "#/nothing" }
+}

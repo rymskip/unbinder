@@ -15,8 +15,8 @@ mod walk;
 pub mod wasm;
 
 pub use crate::dereference::{
-    CircularPolicy, Dereferenced, Options, SharedSchema, SiblingMerge, dereference_schema,
-    dereference_schema_shared, dereference_schema_with,
+    CircularPolicy, Dereferenced, Options, SharedSchema, SiblingMerge, TrueTarget,
+    dereference_schema, dereference_schema_shared, dereference_schema_with,
 };
 pub use crate::documents::Documents;
 pub use crate::error::{Error, PointerError};

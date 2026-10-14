@@ -69,6 +69,22 @@ pub enum SiblingMerge {
     Shallow,
 }
 
+/// What a `$ref` with keywords next to it becomes when it points at the
+/// schema `true`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "wasm",
+    derive(serde::Deserialize, tsify::Tsify),
+    serde(rename_all = "lowercase")
+)]
+pub enum TrueTarget {
+    /// The keywords on their own, since `true` adds nothing to them.
+    #[default]
+    Keep,
+    /// `true`, with the keywords dropped, as json-schema-ref-parser has it.
+    Replace,
+}
+
 /// How to dereference a document.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(
@@ -81,6 +97,9 @@ pub struct Options {
     pub circular: CircularPolicy,
     /// How the keywords next to a `$ref` are combined with its target.
     pub siblings: SiblingMerge,
+    /// What a `$ref` with keywords next to it becomes when it points at the
+    /// schema `true`.
+    pub true_target: TrueTarget,
     /// How deep the output may nest, and how many references a pointer may
     /// pass through in one step. A reference and the value inlined for it
     /// each count as a level.
@@ -109,6 +128,7 @@ impl Default for Options {
         Self {
             circular: CircularPolicy::default(),
             siblings: SiblingMerge::default(),
+            true_target: TrueTarget::default(),
             max_depth: Self::DEFAULT_MAX_DEPTH,
             max_bytes: Self::DEFAULT_MAX_BYTES,
             max_documents: Self::DEFAULT_MAX_DOCUMENTS,
@@ -708,7 +728,8 @@ impl<'doc> Expansion<'doc, '_> {
         // merge into a target that is an object and are all there is next to
         // one that accepts everything. Nothing passes a target that accepts
         // nothing, and any other value is not a schema they could apply to.
-        let accepts_everything = matches!(inlined.shared, Shared::Original(Value::Bool(true)));
+        let accepts_everything = matches!(self.options.true_target, TrueTarget::Keep)
+            && matches!(inlined.shared, Shared::Original(Value::Bool(true)));
         if !accepts_everything && !inlined.shared.is_object() {
             return Ok(inlined);
         }

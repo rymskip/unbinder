@@ -5,7 +5,7 @@ use std::thread::{Builder, JoinHandle};
 
 use serde_json::{Map, Value, json};
 use unbinder::{
-    CircularPolicy, Dereferenced, Error, Options, PointerError, SiblingMerge, Stats,
+    CircularPolicy, Dereferenced, Error, Options, PointerError, SiblingMerge, Stats, TrueTarget,
     dereference_schema, dereference_schema_shared, dereference_schema_with,
 };
 
@@ -498,6 +498,23 @@ fn rejects_an_external_reference() {
             })
         );
     }
+}
+
+#[test]
+fn drops_the_keywords_next_to_a_reference_to_true_on_request() {
+    let schema = json!({
+        "anything": true,
+        "bounded": { "$ref": "#/anything", "maxLength": 5 }
+    });
+    let options = Options {
+        true_target: TrueTarget::Replace,
+        ..Options::default()
+    };
+
+    assert_eq!(
+        dereference_schema_with(&schema, &options),
+        Ok(inlined(json!({ "anything": true, "bounded": true }), &[]))
+    );
 }
 
 #[test]
